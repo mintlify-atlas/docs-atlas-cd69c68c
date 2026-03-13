@@ -1,0 +1,156 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "SlateDB",
+  "projectDescription": "A cloud native embedded storage engine built on object storage.",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/lsm-tree",
+              "concepts/object-storage",
+              "concepts/caching",
+              "concepts/compaction"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/basic-operations",
+              "guides/range-queries",
+              "guides/transactions",
+              "guides/snapshots",
+              "guides/checkpoints",
+              "guides/merge-operators",
+              "guides/change-data-capture",
+              "guides/configuration",
+              "guides/compaction-strategies"
+            ]
+          },
+          {
+            "group": "Language Bindings",
+            "pages": [
+              "bindings/rust",
+              "bindings/python",
+              "bindings/java",
+              "bindings/go"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/overview",
+              "examples/s3-storage",
+              "examples/azure-blob",
+              "examples/google-cloud",
+              "examples/standalone-compactor"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/clean-slate",
+              "advanced/governance",
+              "advanced/performance-tuning",
+              "advanced/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/db",
+              "api/db-builder",
+              "api/write-batch",
+              "api/error"
+            ]
+          },
+          {
+            "group": "Read Operations",
+            "pages": [
+              "api/db-read",
+              "api/db-reader",
+              "api/db-snapshot",
+              "api/db-iterator"
+            ]
+          },
+          {
+            "group": "Transactions",
+            "pages": [
+              "api/db-transaction",
+              "api/isolation-level"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "api/checkpoint",
+              "api/merge-operator",
+              "api/compactor",
+              "api/garbage-collector"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "api/settings",
+              "api/cache-stats",
+              "api/db-stats"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "LSM-tree storage engine built on object storage",
+    "Zero-disk architecture with multi-tier caching",
+    "ACID transactions with snapshot isolation",
+    "Range queries and iterators",
+    "Bloom filters and compression",
+    "Pluggable compaction strategies",
+    "Change data capture (CDC)",
+    "Multi-reader support with single-writer",
+    "Language bindings for Rust, Python, Java, and Go"
+  ],
+  "publicApiSurface": [
+    "Db::open",
+    "Db::put",
+    "Db::get",
+    "Db::delete",
+    "Db::scan",
+    "Db::close",
+    "DbBuilder",
+    "WriteBatch",
+    "DbTransaction",
+    "DbSnapshot",
+    "DbReader",
+    "DbIterator",
+    "Checkpoint",
+    "MergeOperator",
+    "CompactorBuilder",
+    "GarbageCollectorBuilder",
+    "Settings",
+    "IsolationLevel"
+  ]
+}
