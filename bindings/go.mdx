@@ -1,0 +1,686 @@
+---
+title: "Go"
+description: "Use SlateDB in Go applications with the official Go bindings"
+---
+
+SlateDB provides official Go bindings built on the `slatedb-c` FFI layer using CGO. The Go API provides idiomatic Go interfaces for all core SlateDB functionality.
+
+## Requirements
+
+- Go 1.25 or higher
+- CGO enabled
+- C toolchain (`cc`)
+- Rust toolchain (for building `slatedb-c`)
+
+## Installation
+
+```bash
+go get slatedb.io/slatedb-go
+```
+
+## Building
+
+### 1. Build the native library
+
+From the repository root:
+
+```bash
+cargo build -p slatedb-c
+# or for release
+cargo build --release -p slatedb-c
+```
+
+### 2. Set library path
+
+For development, ensure the loader can find `libslatedb_c`:
+
+```bash
+# macOS
+export DYLD_LIBRARY_PATH="$(pwd)/target/debug:$(pwd)/target/release"
+
+# Linux
+export LD_LIBRARY_PATH="$(pwd)/target/debug:$(pwd)/target/release"
+```
+
+### 3. Build and test
+
+```bash
+cd slatedb-go/go
+go build
+go test ./...
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+    "fmt"
+    "slatedb.io/slatedb-go"
+)
+
+func main() {
+    // Open database with explicit URL (recommended)
+    db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("memory:///"))
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+
+    // Put a value
+    _, err = db.Put([]byte("key"), []byte("value"))
+    if err != nil {
+        panic(err)
+    }
+
+    // Get the value
+    value, err := db.Get([]byte("key"))
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println("Value:", string(value))
+
+    // Delete the key
+    _, err = db.Delete([]byte("key"))
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+## Object Store Configuration
+
+The bindings resolve object store configuration in this order:
+
+1. If `WithUrl(...)` is provided, use that URL
+2. Else if `SLATEDB_OBJECT_STORE_URL` or `OBJECT_STORE_URL` environment variable is set, use that
+3. Else use provider-driven config via `CLOUD_PROVIDER` and related variables
+
+### In-Memory Store (Testing)
+
+```go
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("memory:///"))
+```
+
+### Local Filesystem
+
+```go
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("file:///path/to/storage"))
+```
+
+### Amazon S3
+
+```go
+// Using URL
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("s3://my-bucket/slatedb"))
+
+// Using environment file
+db, err := slatedb.Open("/tmp/cache", slatedb.WithEnvFile[slatedb.DbConfig](".env"))
+```
+
+Example `.env` file for S3:
+
+```bash
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-slate-bucket
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+```
+
+### Azure Blob Storage
+
+```go
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("az://container/path"))
+```
+
+### Google Cloud Storage
+
+```go
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("gs://my-bucket/slatedb"))
+```
+
+## Basic Operations
+
+### Put
+
+```go
+// Simple put (returns write handle)
+wh, err := db.Put([]byte("key"), []byte("value"))
+if err != nil {
+    return err
+}
+fmt.Printf("Seq: %d, Timestamp: %d\n", wh.Seq, wh.CreateTs)
+
+// Put with options
+putOpts := &slatedb.PutOptions{
+    TTLType: slatedb.TTLMillis,
+    TTLMillis: 5000, // 5 second TTL
+}
+
+writeOpts := &slatedb.WriteOptions{
+    AwaitDurable: false, // Return immediately
+}
+
+wh, err = db.PutWithOptions([]byte("key"), []byte("value"), putOpts, writeOpts)
+```
+
+### Get
+
+```go
+// Get returns value or nil
+value, err := db.Get([]byte("key"))
+if err != nil {
+    return err
+}
+
+if value != nil {
+    fmt.Println("Found:", string(value))
+} else {
+    fmt.Println("Not found")
+}
+
+// Get with metadata
+kv, err := db.GetKeyValue([]byte("key"))
+if err != nil {
+    return err
+}
+
+if kv != nil {
+    fmt.Printf("Key: %s, Value: %s, Seq: %d\n", kv.Key, kv.Value, kv.Seq)
+}
+
+// Get with options
+readOpts := &slatedb.ReadOptions{
+    DurabilityFilter: slatedb.DurabilityRemote,
+    CacheBlocks: true,
+}
+
+value, err = db.GetWithOptions([]byte("key"), readOpts)
+```
+
+### Delete
+
+```go
+// Simple delete
+_, err := db.Delete([]byte("key"))
+if err != nil {
+    return err
+}
+
+// Delete with options
+writeOpts := &slatedb.WriteOptions{
+    AwaitDurable: true,
+}
+
+_, err = db.DeleteWithOptions([]byte("key"), writeOpts)
+```
+
+## Range Scans
+
+Iterate over ranges of keys:
+
+```go
+import "io"
+
+// Prefix scan (start to end of prefix)
+iter, err := db.ScanPrefix([]byte("user:"))
+if err != nil {
+    return err
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    fmt.Printf("Key: %s, Value: %s\n", kv.Key, kv.Value)
+}
+
+// Bounded range scan
+start := []byte("user:1")
+end := []byte("user:9")
+
+iter, err = db.Scan(start, end)
+if err != nil {
+    return err
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    // Process kv
+}
+
+// Scan with seek
+iter, err = db.ScanPrefix([]byte("user:"))
+if err != nil {
+    return err
+}
+defer iter.Close()
+
+// Seek to specific position
+err = iter.Seek([]byte("user:5"))
+if err != nil {
+    return err
+}
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    // Starts from user:5 or next key
+}
+```
+
+### Scan with Options
+
+```go
+scanOpts := &slatedb.ScanOptions{
+    CacheBlocks: true,
+    ReadAheadBytes: 1 << 20, // 1 MB read-ahead
+}
+
+iter, err := db.ScanWithOptions(start, end, scanOpts)
+if err != nil {
+    return err
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    // Process results
+}
+```
+
+## Batch Writes
+
+Batch multiple operations for atomic execution:
+
+```go
+// Create a batch
+batch, err := slatedb.NewWriteBatch()
+if err != nil {
+    return err
+}
+defer batch.Close()
+
+err = batch.Put([]byte("key1"), []byte("value1"))
+if err != nil {
+    return err
+}
+
+err = batch.Put([]byte("key2"), []byte("value2"))
+if err != nil {
+    return err
+}
+
+err = batch.Delete([]byte("old_key"))
+if err != nil {
+    return err
+}
+
+// Write atomically (batch is consumed and cannot be reused)
+_, err = db.Write(batch)
+if err != nil {
+    return err
+}
+```
+
+## Configuration
+
+Configure SlateDB using the builder:
+
+```go
+builder, err := slatedb.NewBuilder("/tmp/cache")
+if err != nil {
+    return err
+}
+
+settings := &slatedb.Settings{
+    FlushInterval: "50ms",
+    L0SstSizeBytes: 128 * 1024 * 1024, // 128 MB
+}
+
+db, err := builder.
+    WithUrl("memory:///").
+    WithSettings(settings).
+    WithSstBlockSize(slatedb.SstBlockSize16Kib).
+    Build()
+if err != nil {
+    return err
+}
+defer db.Close()
+```
+
+### Settings Helpers
+
+```go
+// Get default settings
+settings, err := slatedb.SettingsDefault()
+
+// Load from file (JSON, TOML, YAML)
+settings, err := slatedb.SettingsFromFile("config.toml")
+
+// Load from environment variables
+settings, err := slatedb.SettingsFromEnv("SLATEDB_")
+
+// Auto-detect from well-known files
+settings, err := slatedb.SettingsLoad()
+
+// Merge settings
+base, _ := slatedb.SettingsDefault()
+override := &slatedb.Settings{
+    FlushInterval: "100ms",
+}
+merged, err := slatedb.MergeSettings(base, override)
+```
+
+## Read-Only Access
+
+Open a database in read-only mode:
+
+```go
+// Open read-only reader
+reader, err := slatedb.OpenReader(
+    "/tmp/cache",
+    slatedb.WithUrl[slatedb.DbReaderConfig]("memory:///"),
+    slatedb.WithDbReaderOptions(slatedb.DbReaderOptions{
+        ManifestPollInterval: 5000, // 5 seconds
+    }),
+)
+if err != nil {
+    return err
+}
+defer reader.Close()
+
+// Read operations only
+value, err := reader.Get([]byte("key"))
+if err != nil {
+    return err
+}
+
+iter, err := reader.ScanPrefix([]byte("prefix:"))
+if err != nil {
+    return err
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    // Process results
+}
+```
+
+### Reader with Checkpoint
+
+```go
+reader, err := slatedb.OpenReader(
+    "/tmp/cache",
+    slatedb.WithUrl[slatedb.DbReaderConfig]("memory:///"),
+    slatedb.WithCheckpointId("550e8400-e29b-41d4-a716-446655440000"),
+)
+```
+
+## Flush Operations
+
+```go
+// Flush to object storage
+err := db.Flush()
+if err != nil {
+    return err
+}
+```
+
+## Logging
+
+Initialize logging with different levels:
+
+```go
+import "slatedb.io/slatedb-go"
+
+// Initialize once at startup
+err := slatedb.InitLogging(slatedb.LogLevelInfo)
+if err != nil {
+    return err
+}
+
+// Change log level
+err = slatedb.SetLoggingLevel(slatedb.LogLevelDebug)
+
+// Available levels:
+// LogLevelError
+// LogLevelWarn
+// LogLevelInfo
+// LogLevelDebug
+// LogLevelTrace
+```
+
+## Error Handling
+
+```go
+value, err := db.Get([]byte("key"))
+if err != nil {
+    switch {
+    case errors.Is(err, slatedb.ErrNotFound):
+        fmt.Println("Key not found")
+    case errors.Is(err, slatedb.ErrClosed):
+        fmt.Println("Database closed")
+    case errors.Is(err, slatedb.ErrInvalidArgument):
+        fmt.Println("Invalid argument")
+    default:
+        fmt.Printf("Error: %v\n", err)
+    }
+    return err
+}
+```
+
+## Testing
+
+For unit tests, use the in-memory store:
+
+```go
+import (
+    "testing"
+    "slatedb.io/slatedb-go"
+)
+
+func TestDatabase(t *testing.T) {
+    db, err := slatedb.Open("/tmp/test", slatedb.WithUrl[slatedb.DbConfig]("memory:///"))
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+
+    key := []byte("test")
+    value := []byte("data")
+
+    _, err = db.Put(key, value)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    result, err := db.Get(key)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if string(result) != string(value) {
+        t.Errorf("got %s, want %s", result, value)
+    }
+}
+```
+
+## API Quick Reference
+
+### Core DB Operations
+
+```go
+type DB struct { ... }
+
+func Open(path string, opts ...Option[DbConfig]) (*DB, error)
+func (db *DB) Put(key, value []byte) (*WriteHandle, error)
+func (db *DB) Get(key []byte) ([]byte, error)
+func (db *DB) Delete(key []byte) (*WriteHandle, error)
+func (db *DB) Flush() error
+func (db *DB) Close() error
+```
+
+### With Options
+
+```go
+func (db *DB) PutWithOptions(key, value []byte, putOpts *PutOptions, writeOpts *WriteOptions) (*WriteHandle, error)
+func (db *DB) GetWithOptions(key []byte, readOpts *ReadOptions) ([]byte, error)
+func (db *DB) GetKeyValue(key []byte) (*KeyValue, error)
+func (db *DB) DeleteWithOptions(key []byte, writeOpts *WriteOptions) (*WriteHandle, error)
+```
+
+### Batch Operations
+
+```go
+type WriteBatch struct { ... }
+
+func NewWriteBatch() (*WriteBatch, error)
+func (wb *WriteBatch) Put(key, value []byte) error
+func (wb *WriteBatch) Delete(key []byte) error
+func (wb *WriteBatch) Close() error
+
+func (db *DB) Write(batch *WriteBatch) (*WriteHandle, error)
+func (db *DB) WriteWithOptions(batch *WriteBatch, opts *WriteOptions) (*WriteHandle, error)
+```
+
+### Scan Operations
+
+```go
+type Iterator struct { ... }
+type KeyValue struct {
+    Key      []byte
+    Value    []byte
+    Seq      uint64
+    CreateTs uint64
+}
+
+func (db *DB) Scan(start, end []byte) (*Iterator, error)
+func (db *DB) ScanPrefix(prefix []byte) (*Iterator, error)
+func (db *DB) ScanWithOptions(start, end []byte, opts *ScanOptions) (*Iterator, error)
+func (iter *Iterator) Next() (KeyValue, error)
+func (iter *Iterator) Seek(key []byte) error
+func (iter *Iterator) Close() error
+```
+
+### Reader
+
+```go
+type DbReader struct { ... }
+
+func OpenReader(path string, opts ...Option[DbReaderConfig]) (*DbReader, error)
+func (r *DbReader) Get(key []byte) ([]byte, error)
+func (r *DbReader) Scan(start, end []byte) (*Iterator, error)
+func (r *DbReader) ScanPrefix(prefix []byte) (*Iterator, error)
+func (r *DbReader) Close() error
+```
+
+## Comparison with Rust API
+
+<CodeGroup>
+
+```go Go
+db, err := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("memory:///"))
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+
+_, err = db.Put([]byte("key"), []byte("value"))
+value, err := db.Get([]byte("key"))
+_, err = db.Delete([]byte("key"))
+```
+
+```rust Rust
+let db = Db::open("/tmp/cache", object_store).await?;
+db.put(b"key", b"value").await?;
+let value = db.get(b"key").await?;
+db.delete(b"key").await?;
+db.close().await?;
+```
+
+</CodeGroup>
+
+Key differences:
+- Go API uses synchronous blocking calls with error returns
+- Rust API is fully async and requires `.await`
+- Go uses `nil` for missing values, Rust uses `Option<Bytes>`
+- Go uses multiple return values for errors, Rust uses `Result<T, Error>`
+- Go requires CGO and `libslatedb_c` at runtime
+
+## Environment Variables
+
+### Local Filesystem
+
+```bash
+CLOUD_PROVIDER=local
+LOCAL_PATH=/path/to/storage
+```
+
+### AWS S3
+
+```bash
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-slate-bucket
+AWS_REGION=us-west-2
+AWS_ENDPOINT=https://s3.us-west-2.amazonaws.com
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+```
+
+### Direct URL Override
+
+```bash
+SLATEDB_OBJECT_STORE_URL=memory:///
+# or
+OBJECT_STORE_URL=file:///tmp/slatedb
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rust Bindings" icon="rust" href="/bindings/rust">
+    Compare with the native Rust API
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Learn about configuration options
+  </Card>
+  <Card title="Basic Operations" icon="play" href="/guides/basic-operations">
+    Learn core database operations
+  </Card>
+  <Card title="Examples" icon="flask" href="/examples/overview">
+    See complete working examples
+  </Card>
+</CardGroup>

@@ -1,0 +1,527 @@
+---
+title: "Python"
+description: "Use SlateDB in Python applications with the official Python bindings"
+---
+
+SlateDB provides official Python bindings built on the Rust core using [Maturin](https://www.maturin.rs/). The Python API supports both synchronous and asynchronous operations.
+
+## Installation
+
+Install SlateDB from PyPI:
+
+```bash
+pip install slatedb
+```
+
+### Requirements
+
+- Python 3.10 or higher
+- Works on Linux, macOS, and Windows
+
+## Quick Start
+
+```python
+from slatedb import SlateDB
+
+# Open a database with in-memory object store
+db = SlateDB("/tmp/slatedb-demo", url="memory:///")
+
+# Basic operations
+db.put(b"user:1", b"Alice")
+value = db.get(b"user:1")
+assert value == b"Alice"
+
+# Delete
+db.delete(b"user:1")
+assert db.get(b"user:1") is None
+
+# Close the database
+db.close()
+```
+
+## Object Store Configuration
+
+### In-Memory Store (Testing)
+
+```python
+db = SlateDB("/tmp/db", url="memory:///")
+```
+
+### Local Filesystem
+
+```python
+db = SlateDB("/tmp/db", url="file:///path/to/storage")
+```
+
+### Amazon S3
+
+```python
+# Using URL
+db = SlateDB("/tmp/db", url="s3://my-bucket/slatedb")
+
+# Using environment variables in .env file
+db = SlateDB("/tmp/db", env_file=".env")
+```
+
+Example `.env` file for S3:
+
+```bash
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-bucket
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+```
+
+### Azure Blob Storage
+
+```python
+db = SlateDB("/tmp/db", url="az://container/path")
+```
+
+### Google Cloud Storage
+
+```python
+db = SlateDB("/tmp/db", url="gs://my-bucket/slatedb")
+```
+
+## Basic Operations
+
+### Put
+
+```python
+# Simple put (waits for durability)
+db.put(b"key", b"value")
+
+# Put with options
+db.put_with_options(
+    b"key",
+    b"value",
+    ttl=5000,  # TTL in milliseconds
+    await_durable=False  # Return immediately
+)
+```
+
+### Get
+
+```python
+# Returns bytes or None
+value = db.get(b"key")
+if value is not None:
+    print(f"Found: {value}")
+else:
+    print("Not found")
+
+# Get with options
+value = db.get_with_options(b"key", cache_blocks=True)
+```
+
+### Delete
+
+```python
+# Simple delete
+db.delete(b"key")
+
+# Delete with options
+db.delete_with_options(b"key", await_durable=True)
+```
+
+## Async Operations
+
+SlateDB supports async/await for concurrent operations:
+
+```python
+import asyncio
+from slatedb import SlateDB
+
+async def main():
+    db = SlateDB("/tmp/db", url="memory:///")
+
+    # Async put and get
+    await db.put_async(b"key1", b"value1")
+    value = await db.get_async(b"key1")
+    assert value == b"value1"
+
+    # Concurrent operations
+    await asyncio.gather(
+        db.put_async(b"key1", b"value1"),
+        db.put_async(b"key2", b"value2"),
+        db.put_async(b"key3", b"value3")
+    )
+
+    # Async delete
+    await db.delete_async(b"key1")
+
+    db.close()
+
+asyncio.run(main())
+```
+
+## Range Scans
+
+Iterate over ranges of keys:
+
+```python
+# Add some data
+db.put(b"user:1", b"Alice")
+db.put(b"user:2", b"Bob")
+db.put(b"user:3", b"Carol")
+
+# Prefix scan (keys starting with "user:")
+iterator = db.scan(b"user:")
+for kv in iterator:
+    print(f"Key: {kv.key}, Value: {kv.value}")
+
+# Bounded range scan
+iterator = db.scan(b"user:1", end=b"user:3")
+for kv in iterator:
+    print(f"Key: {kv.key}, Value: {kv.value}")
+
+# Seek to a specific key
+iterator = db.scan(b"user:")
+iterator.seek(b"user:2")
+for kv in iterator:
+    # Starts from user:2
+    print(f"Key: {kv.key}, Value: {kv.value}")
+```
+
+### Scan with Options
+
+```python
+# Advanced scan options
+iterator = db.scan_with_options(
+    start=b"user:",
+    cache_blocks=True,
+    read_ahead_bytes=1 << 20  # 1 MB read-ahead
+)
+
+for kv in iterator:
+    print(f"Key: {kv.key}, Value: {kv.value}")
+```
+
+## Batch Writes
+
+Batch multiple operations for atomic execution:
+
+```python
+from slatedb import WriteBatch
+
+# Create a batch
+batch = WriteBatch()
+batch.put(b"key1", b"value1")
+batch.put(b"key2", b"value2")
+batch.delete(b"old_key")
+
+# Write atomically
+db.write(batch)
+```
+
+## Transactions
+
+SlateDB supports transactions with snapshot isolation (SI) or serializable snapshot isolation (SSI):
+
+```python
+# Snapshot Isolation
+txn = db.begin("si")
+txn.put(b"key1", b"value1")
+txn.put(b"key2", b"value2")
+
+# Read within transaction
+value = txn.get(b"key1")
+
+# Commit the transaction
+txn.commit()
+
+# Serializable Snapshot Isolation
+txn = db.begin("ssi")
+txn.put(b"counter", b"1")
+txn.commit()
+```
+
+### Transaction Error Handling
+
+```python
+from slatedb import TransactionError
+
+try:
+    txn = db.begin("ssi")
+    txn.put(b"key", b"value")
+    txn.commit()
+except TransactionError as e:
+    print(f"Transaction failed: {e}")
+    # Handle conflict or abort
+```
+
+## Snapshots
+
+Create consistent, read-only views:
+
+```python
+# Create a snapshot
+snapshot = db.snapshot()
+
+# Reads see a consistent view
+value = snapshot.get(b"key")
+
+# Scan from snapshot
+for kv in snapshot.scan(b"user:"):
+    print(f"Key: {kv.key}, Value: {kv.value}")
+```
+
+## Merge Operators
+
+Define custom merge logic using Python callables:
+
+```python
+def concat_merge(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    """Concatenate values."""
+    return (existing or b"") + value
+
+# Open database with merge operator
+db = SlateDB(
+    "/tmp/db",
+    url="memory:///",
+    merge_operator=concat_merge
+)
+
+# Use merge operations
+db.merge(b"log", b"entry1\n")
+db.merge(b"log", b"entry2\n")
+
+result = db.get(b"log")
+assert result == b"entry1\nentry2\n"
+```
+
+### Counter Example
+
+```python
+def counter_merge(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    """Sum numeric values."""
+    current = int(existing) if existing else 0
+    increment = int(value)
+    return str(current + increment).encode()
+
+db = SlateDB(
+    "/tmp/db",
+    url="memory:///",
+    merge_operator=counter_merge
+)
+
+db.merge(b"visits", b"1")
+db.merge(b"visits", b"5")
+
+assert db.get(b"visits") == b"6"
+```
+
+## Checkpoints
+
+Create durable checkpoints for point-in-time recovery:
+
+```python
+from slatedb import SlateDBReader
+
+# Create a checkpoint
+checkpoint = db.create_checkpoint(scope="durable")
+print(f"Checkpoint ID: {checkpoint['id']}")
+
+# Open a read-only reader at the checkpoint
+reader = SlateDBReader(
+    "/tmp/db",
+    url="memory:///",
+    checkpoint_id=checkpoint["id"]
+)
+
+value = reader.get(b"key")
+reader.close()
+```
+
+## Read-Only Access
+
+Open a database in read-only mode:
+
+```python
+from slatedb import SlateDBReader
+
+# Open read-only reader
+reader = SlateDBReader(
+    "/tmp/db",
+    url="memory:///",
+    manifest_poll_interval=5000  # Poll every 5 seconds
+)
+
+# Read operations only
+value = reader.get(b"key")
+for kv in reader.scan(b"prefix:"):
+    print(f"Key: {kv.key}, Value: {kv.value}")
+
+reader.close()
+```
+
+## Flush Operations
+
+Control when data is flushed to object storage:
+
+```python
+# Flush WAL
+db.flush_with_options("wal")
+
+# Flush memtable
+db.flush_with_options("memtable")
+
+# Flush all
+db.flush_with_options("all")
+```
+
+## Admin Operations
+
+Perform administrative tasks:
+
+```python
+from slatedb import SlateDBAdmin
+
+admin = SlateDBAdmin("/tmp/db", url="memory:///")
+
+# List checkpoints
+checkpoints = admin.list_checkpoints()
+for checkpoint in checkpoints:
+    print(f"Checkpoint: {checkpoint}")
+
+# Read manifest
+manifest = admin.read_manifest()
+print(f"Manifest: {manifest}")
+
+# Run garbage collection
+admin.run_gc_once(
+    manifest_min_age=0,
+    wal_min_age=0,
+    compacted_min_age=0
+)
+```
+
+## Metrics
+
+Monitor database performance:
+
+```python
+# Get database metrics
+metrics = db.metrics()
+print(f"Metrics: {metrics}")
+```
+
+## Context Manager
+
+Use SlateDB with Python's context manager:
+
+```python
+with SlateDB("/tmp/db", url="memory:///") as db:
+    db.put(b"key", b"value")
+    value = db.get(b"key")
+    # Database automatically closed
+```
+
+## Error Handling
+
+```python
+from slatedb import (
+    SlateDB,
+    ClosedError,
+    InvalidError,
+    UnavailableError,
+    TransactionError
+)
+
+try:
+    db = SlateDB("/tmp/db", url="memory:///")
+    db.put(b"key", b"value")
+    value = db.get(b"key")
+except InvalidError as e:
+    print(f"Invalid argument: {e}")
+except ClosedError as e:
+    print(f"Database closed: {e}")
+except UnavailableError as e:
+    print(f"Service unavailable: {e}")
+except TransactionError as e:
+    print(f"Transaction error: {e}")
+finally:
+    if db:
+        db.close()
+```
+
+## Type Hints
+
+The Python bindings include full type hints:
+
+```python
+from typing import Optional
+from slatedb import SlateDB
+
+def get_user(db: SlateDB, user_id: int) -> Optional[bytes]:
+    key = f"user:{user_id}".encode()
+    return db.get(key)
+```
+
+## Development
+
+For contributing to the Python bindings:
+
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment
+uv venv
+
+# Install dependencies
+uv pip install -e .[test]
+
+# Build with Maturin
+uv run maturin develop
+
+# Run tests
+uv run pytest
+```
+
+## Comparison with Rust API
+
+<CodeGroup>
+
+```python Python
+db = SlateDB("/tmp/db", url="memory:///")
+db.put(b"key", b"value")
+value = db.get(b"key")
+db.delete(b"key")
+db.close()
+```
+
+```rust Rust
+let db = Db::open("/tmp/db", object_store).await?;
+db.put(b"key", b"value").await?;
+let value = db.get(b"key").await?;
+db.delete(b"key").await?;
+db.close().await?;
+```
+
+</CodeGroup>
+
+Key differences:
+- Python API uses synchronous calls by default (async available with `_async` suffix)
+- Rust API is fully async and requires `.await`
+- Python uses `None` for missing values, Rust uses `Option<Bytes>`
+- Python uses exceptions, Rust uses `Result<T, Error>`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rust Bindings" icon="rust" href="/bindings/rust">
+    Compare with the native Rust API
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Learn about configuration options
+  </Card>
+  <Card title="Transactions" icon="arrows-rotate" href="/guides/transactions">
+    Deep dive into transactions
+  </Card>
+  <Card title="Examples" icon="flask" href="/examples/overview">
+    See complete working examples
+  </Card>
+</CardGroup>

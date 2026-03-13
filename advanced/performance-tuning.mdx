@@ -1,0 +1,368 @@
+---
+title: Performance Tuning
+description: Optimize SlateDB for your workload with cache settings, compression, and durability tuning
+---
+
+# Performance Tuning
+
+SlateDB provides several configuration options to optimize performance for your specific workload. This guide covers the key areas where you can tune performance: cache settings, compression options, and durability settings.
+
+## Cache Settings
+
+Caching is critical for reducing object storage API costs and improving read latency. SlateDB provides multiple caching layers.
+
+### Block Cache
+
+The block cache stores decompressed SST blocks in memory.
+
+<Tabs>
+  <Tab title="Foyer Cache">
+    ```rust
+    use slatedb::config::DbOptions;
+    use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+    use std::sync::Arc;
+
+    let block_cache = Arc::new(FoyerCache::new_with_opts(
+        FoyerCacheOptions {
+            max_capacity: 512 * 1024 * 1024, // 512MB
+            ..Default::default()
+        },
+    ));
+
+    let options = DbOptions::default()
+        .with_block_cache(block_cache);
+    ```
+  </Tab>
+  
+  <Tab title="Moka Cache">
+    ```rust
+    use slatedb::config::DbOptions;
+    use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let block_cache = Arc::new(MokaCache::new_with_opts(
+        MokaCacheOptions {
+            max_capacity: 512 * 1024 * 1024, // 512MB
+            time_to_live: Some(Duration::from_secs(3600)),
+            time_to_idle: Some(Duration::from_secs(600)),
+        },
+    ));
+
+    let options = DbOptions::default()
+        .with_block_cache(block_cache);
+    ```
+  </Tab>
+</Tabs>
+
+<Info>
+The default block cache capacity is defined in `slatedb/src/config.rs:1003`. Adjust based on your available memory and workload.
+</Info>
+
+### Disk Cache
+
+The disk cache stores SST files locally to avoid repeated fetches from object storage.
+
+```rust
+use slatedb::config::{DbOptions, ObjectStoreCacheOptions};
+use std::path::PathBuf;
+
+let mut options = DbOptions::default();
+options.object_store_cache_options = ObjectStoreCacheOptions {
+    root_folder: Some(PathBuf::from("/var/cache/slatedb")),
+    max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024), // 16GB
+    part_size_bytes: 4 * 1024 * 1024, // 4MB parts
+    cache_puts: true, // Cache writes for faster subsequent reads
+    preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+    scan_interval: Some(Duration::from_secs(3600)),
+};
+```
+
+<Accordion title="ObjectStoreCacheOptions Fields">
+  - **root_folder**: Path to cache directory (None disables disk cache)
+  - **max_cache_size_bytes**: Maximum cache size (default: 16GB on 64-bit, 4GB on 32-bit)
+  - **part_size_bytes**: Size of each cached part file (default: 4MB, must be aligned to 1KB)
+  - **cache_puts**: Whether to cache PUT operations (default: false)
+  - **preload_disk_cache_on_startup**: Preload SSTs on startup (`L0Sst` or `AllSst`)
+  - **scan_interval**: How often to scan cache directory (default: 1 hour)
+</Accordion>
+
+### Read Options
+
+Control caching behavior per-read operation:
+
+```rust
+use slatedb::config::ReadOptions;
+
+let read_opts = ReadOptions::new()
+    .with_cache_blocks(true); // Enable block caching for this read
+
+let value = db.get_with_options(b"key", read_opts).await?;
+```
+
+<Tip>
+For scans, you can also configure `read_ahead_bytes` and `max_fetch_tasks` to optimize throughput.
+</Tip>
+
+## Compression Options
+
+Compression reduces object storage costs and network bandwidth at the cost of CPU cycles.
+
+### Supported Codecs
+
+<CardGroup cols={2}>
+  <Card title="Snappy" icon="bolt">
+    Fast compression with moderate ratios. Good general-purpose choice.
+  </Card>
+  
+  <Card title="Zlib" icon="compress">
+    Better compression ratios, slower than Snappy.
+  </Card>
+  
+  <Card title="LZ4" icon="gauge-high">
+    Extremely fast with good compression ratios.
+  </Card>
+  
+  <Card title="Zstd" icon="balance-scale">
+    Best compression ratios, tunable performance.
+  </Card>
+</CardGroup>
+
+### Configuration
+
+```rust
+use slatedb::config::{DbOptions, CompressionCodec};
+
+let options = DbOptions::default()
+    .with_compression_codec(Some(CompressionCodec::Zstd));
+
+let db = Db::open_with_opts("/tmp/db", object_store, options).await?;
+```
+
+<Note>
+Compression is applied at the SST block level. See `slatedb/src/config.rs:1045-1062` for available codecs.
+</Note>
+
+### Choosing a Codec
+
+<AccordionGroup>
+  <Accordion title="When to use Snappy">
+    - General-purpose workloads
+    - Balanced CPU and storage costs
+    - Default choice if unsure
+  </Accordion>
+  
+  <Accordion title="When to use LZ4">
+    - CPU-constrained environments
+    - Need maximum throughput
+    - Can tolerate larger storage costs
+  </Accordion>
+  
+  <Accordion title="When to use Zstd">
+    - Storage costs are primary concern
+    - Can afford higher CPU usage
+    - Have large datasets
+  </Accordion>
+  
+  <Accordion title="When to use Zlib">
+    - Legacy compatibility
+    - Mid-range between Snappy and Zstd
+  </Accordion>
+</AccordionGroup>
+
+## Durability Tuning
+
+Balance write latency against durability guarantees.
+
+### Flush Interval
+
+The flush interval controls how often the WAL is written to object storage:
+
+```rust
+use slatedb::config::DbOptions;
+use std::time::Duration;
+
+let mut options = DbOptions::default();
+options.flush_interval = Some(Duration::from_millis(100)); // 100ms
+```
+
+<Warning>
+**Trade-offs:**
+- **Lower interval**: Better durability, higher write latency, more API costs (~$130/month for 100ms on S3)
+- **Higher interval**: Lower API costs, worse durability, longer recovery times
+- **None**: Disables automatic flushing (call `db.flush()` manually)
+</Warning>
+
+### Write Options
+
+Control durability per write operation:
+
+```rust
+use slatedb::config::WriteOptions;
+
+// Wait for durable write (default)
+let write_opts = WriteOptions {
+    await_durable: true,
+};
+db.put_with_options(b"key", b"value", write_opts).await?;
+
+// Don't wait for durability (lower latency)
+let write_opts = WriteOptions {
+    await_durable: false,
+};
+db.put_with_options(b"key", b"value", write_opts).await?;
+```
+
+### Memtable Size
+
+Control how large memtables grow before flushing to L0:
+
+```rust
+let mut options = DbOptions::default();
+options.l0_sst_size_bytes = 128 * 1024 * 1024; // 128MB
+options.max_unflushed_bytes = 2 * 1024 * 1024 * 1024; // 2GB max unflushed
+```
+
+<AccordionGroup>
+  <Accordion title="Trade-offs of l0_sst_size_bytes">
+    **Larger values:**
+    - Longer recovery times (more data in WAL)
+    - Fewer L0 SSTs (faster reads)
+    - Higher memory usage
+    - Lower API costs
+    - Higher secondary reader latency
+    
+    **Smaller values:**
+    - Faster recovery
+    - More L0 SSTs (slower reads)
+    - Lower memory usage
+    - Higher API costs
+    - Lower secondary reader latency
+  </Accordion>
+  
+  <Accordion title="Backpressure with max_unflushed_bytes">
+    When unflushed data exceeds `max_unflushed_bytes`, writes are paused until data is flushed. This prevents unbounded memory growth.
+    
+    Default: 1GB (see `slatedb/src/config.rs:911`)
+  </Accordion>
+</AccordionGroup>
+
+## Bloom Filters
+
+Bloom filters reduce unnecessary reads to SSTs:
+
+```rust
+let mut options = DbOptions::default();
+options.min_filter_keys = 1000; // Only create filters for SSTs with 1000+ keys
+options.filter_bits_per_key = 10; // ~0.82% false positive rate
+```
+
+<Info>
+The false positive rate is evaluated per sorted run. For databases with many sorted runs, consider increasing `filter_bits_per_key` if you have available memory.
+</Info>
+
+## Block Size
+
+Configure SST block sizes (test environments only):
+
+```rust
+#[cfg(test)]
+use slatedb::config::SstBlockSize;
+
+#[cfg(test)]
+let mut options = DbOptions::default();
+#[cfg(test)]
+options.block_format = Some(BlockFormat::V2(SstBlockSize::Block8Kib));
+```
+
+<Note>
+Block size configuration is only available in test builds. Available sizes: 1KB, 2KB, 4KB (default), 8KB, 16KB, 32KB, 64KB.
+</Note>
+
+## Monitoring Performance
+
+SlateDB exposes statistics to monitor performance:
+
+```rust
+let stats = db.stats();
+
+// Key metrics from slatedb/src/db_stats.rs:
+// - immutable_memtable_flushes: Number of memtable flushes
+// - wal_buffer_flushes: Number of WAL flushes
+// - sst_filter_positives: Bloom filter hits
+// - sst_filter_false_positives: Bloom filter false positives
+// - backpressure_count: Times writes were throttled
+// - get_requests: Number of get operations
+// - scan_requests: Number of scan operations
+// - write_ops: Number of write operations
+// - total_mem_size_bytes: Total memory usage
+// - l0_sst_count: Number of L0 SSTs
+```
+
+<Card title="Statistics Reference" icon="chart-line" href="/api/db-stats">
+  See the full DB Statistics API reference
+</Card>
+
+## Best Practices
+
+<Steps>
+  <Step title="Start with defaults">
+    SlateDB's defaults are tuned for general-purpose workloads.
+  </Step>
+  
+  <Step title="Monitor your workload">
+    Use statistics to understand your access patterns.
+  </Step>
+  
+  <Step title="Tune caching first">
+    Caching has the biggest impact on performance and costs.
+  </Step>
+  
+  <Step title="Adjust durability settings">
+    Balance latency requirements against durability needs.
+  </Step>
+  
+  <Step title="Optimize compression">
+    Choose a codec based on your CPU/storage trade-off.
+  </Step>
+  
+  <Step title="Test changes">
+    Always benchmark configuration changes with your workload.
+  </Step>
+</Steps>
+
+## Configuration Examples
+
+<AccordionGroup>
+  <Accordion title="High-Throughput Writes">
+    ```rust
+    let mut options = DbOptions::default();
+    options.flush_interval = Some(Duration::from_millis(500));
+    options.l0_sst_size_bytes = 256 * 1024 * 1024; // 256MB
+    options.max_unflushed_bytes = 4 * 1024 * 1024 * 1024; // 4GB
+    options.compression_codec = Some(CompressionCodec::Lz4);
+    ```
+  </Accordion>
+  
+  <Accordion title="Cost-Optimized Reads">
+    ```rust
+    let mut options = DbOptions::default();
+    options.object_store_cache_options.root_folder = Some(PathBuf::from("/cache"));
+    options.object_store_cache_options.max_cache_size_bytes = Some(50 * 1024 * 1024 * 1024);
+    options.object_store_cache_options.cache_puts = true;
+    options.compression_codec = Some(CompressionCodec::Zstd);
+    options.filter_bits_per_key = 12; // Lower false positive rate
+    ```
+  </Accordion>
+  
+  <Accordion title="Low-Latency Operations">
+    ```rust
+    let mut options = DbOptions::default();
+    options.flush_interval = Some(Duration::from_millis(50));
+    options.l0_sst_size_bytes = 32 * 1024 * 1024; // 32MB
+    options.compression_codec = Some(CompressionCodec::Lz4);
+    
+    let write_opts = WriteOptions { await_durable: false };
+    ```
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,432 @@
+---
+title: Cache Statistics
+description: Monitor cache performance and hit rates in SlateDB
+---
+
+SlateDB provides comprehensive cache statistics to help you monitor and optimize cache performance. There are two types of caches: the in-memory database cache (DbCache) and the object store disk cache.
+
+## Accessing Cache Statistics
+
+Cache statistics are available through the metrics registry:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Get the metrics registry
+    let metrics = db.metrics();
+    
+    // Access specific cache statistics
+    if let Some(filter_hits) = metrics.lookup("dbcache/filter_hit") {
+        println!("Filter cache hits: {}", filter_hits.get());
+    }
+    
+    Ok(())
+}
+```
+
+## Database Cache Statistics
+
+The database cache (DbCache) stores SSTable blocks, indices, filters, and statistics in memory. All DbCache metrics are prefixed with `dbcache/`.
+
+### Filter Cache
+
+Bloom filter cache statistics:
+
+#### dbcache/filter_hit
+
+**Type:** Counter  
+**Description:** Number of times a bloom filter was found in the cache
+
+High filter hit rates indicate that bloom filters are being reused effectively, reducing the need to fetch them from object storage.
+
+```rust
+let filter_hits = metrics.lookup("dbcache/filter_hit")?.get();
+```
+
+#### dbcache/filter_miss
+
+**Type:** Counter  
+**Description:** Number of times a bloom filter was not found in the cache and had to be loaded from object storage
+
+High filter miss rates may indicate that your filter cache is too small or has high churn.
+
+```rust
+let filter_misses = metrics.lookup("dbcache/filter_miss")?.get();
+```
+
+**Cache Hit Rate:**
+```rust
+let hit_rate = filter_hits as f64 / (filter_hits + filter_misses) as f64;
+println!("Filter cache hit rate: {:.2}%", hit_rate * 100.0);
+```
+
+### Index Cache
+
+SSTable index cache statistics:
+
+#### dbcache/index_hit
+
+**Type:** Counter  
+**Description:** Number of times an SSTable index was found in the cache
+
+High index hit rates improve read performance by avoiding index lookups from object storage.
+
+```rust
+let index_hits = metrics.lookup("dbcache/index_hit")?.get();
+```
+
+#### dbcache/index_miss
+
+**Type:** Counter  
+**Description:** Number of times an SSTable index was not found in the cache and had to be loaded from object storage
+
+```rust
+let index_misses = metrics.lookup("dbcache/index_miss")?.get();
+```
+
+### Data Block Cache
+
+SSTable data block cache statistics:
+
+#### dbcache/data_block_hit
+
+**Type:** Counter  
+**Description:** Number of times a data block was found in the cache
+
+Data block cache hits significantly improve read performance, especially for sequential or nearby reads.
+
+```rust
+let block_hits = metrics.lookup("dbcache/data_block_hit")?.get();
+```
+
+#### dbcache/data_block_miss
+
+**Type:** Counter  
+**Description:** Number of times a data block was not found in the cache and had to be loaded from object storage
+
+High miss rates may indicate insufficient cache capacity for your workload.
+
+```rust
+let block_misses = metrics.lookup("dbcache/data_block_miss")?.get();
+```
+
+### Stats Cache
+
+SSTable statistics cache:
+
+#### dbcache/stats_hit
+
+**Type:** Counter  
+**Description:** Number of times SSTable statistics were found in the cache
+
+```rust
+let stats_hits = metrics.lookup("dbcache/stats_hit")?.get();
+```
+
+#### dbcache/stats_miss
+
+**Type:** Counter  
+**Description:** Number of times SSTable statistics were not found in the cache
+
+```rust
+let stats_misses = metrics.lookup("dbcache/stats_miss")?.get();
+```
+
+### Error Tracking
+
+#### dbcache/get_error
+
+**Type:** Counter  
+**Description:** Number of errors encountered when attempting to get entries from the cache
+
+This counter tracks cache-level errors. Non-zero values may indicate issues with the cache implementation or resource exhaustion.
+
+```rust
+let cache_errors = metrics.lookup("dbcache/get_error")?.get();
+```
+
+## Object Store Cache Statistics
+
+The object store cache is a local disk cache that stores parts of objects fetched from remote object storage. All object store cache metrics are prefixed with `oscache/`.
+
+### Cache Access
+
+#### oscache/part_access
+
+**Type:** Counter  
+**Description:** Total number of part access attempts (both hits and misses)
+
+This represents the total number of times the cache was consulted for object store data.
+
+```rust
+let part_accesses = metrics.lookup("oscache/part_access")?.get();
+```
+
+#### oscache/part_hits
+
+**Type:** Counter  
+**Description:** Number of times a requested part was found in the disk cache
+
+High hit rates reduce object storage API calls and improve read latency.
+
+```rust
+let part_hits = metrics.lookup("oscache/part_hits")?.get();
+```
+
+**Cache Hit Rate:**
+```rust
+let hit_rate = part_hits as f64 / part_accesses as f64;
+println!("Object store cache hit rate: {:.2}%", hit_rate * 100.0);
+```
+
+### Cache Size
+
+#### oscache/cache_keys
+
+**Type:** Gauge (u64)  
+**Description:** Current number of keys (parts) stored in the cache
+
+Monitor this to understand cache utilization.
+
+```rust
+let cache_keys = metrics.lookup("oscache/cache_keys")?.get();
+```
+
+#### oscache/cache_bytes
+
+**Type:** Gauge (u64)  
+**Description:** Current total size of cached data in bytes
+
+Compare this to `max_cache_size_bytes` in your configuration to understand cache capacity usage.
+
+```rust
+let cache_bytes = metrics.lookup("oscache/cache_bytes")?.get();
+let cache_mb = cache_bytes as f64 / (1024.0 * 1024.0);
+println!("Cache size: {:.2} MB", cache_mb);
+```
+
+### Cache Eviction
+
+#### oscache/evicted_keys
+
+**Type:** Counter  
+**Description:** Cumulative number of cache entries (parts) that have been evicted
+
+High eviction rates may indicate that the cache is too small for your workload.
+
+```rust
+let evicted_keys = metrics.lookup("oscache/evicted_keys")?.get();
+```
+
+#### oscache/evicted_bytes
+
+**Type:** Counter  
+**Description:** Cumulative number of bytes that have been evicted from the cache
+
+```rust
+let evicted_bytes = metrics.lookup("oscache/evicted_bytes")?.get();
+let evicted_gb = evicted_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+println!("Total evicted: {:.2} GB", evicted_gb);
+```
+
+## Monitoring Best Practices
+
+### 1. Calculate Hit Rates
+
+Hit rates are the most important cache metrics. Low hit rates indicate cache inefficiency:
+
+```rust
+fn calculate_hit_rate(hits: i64, misses: i64) -> f64 {
+    if hits + misses == 0 {
+        return 0.0;
+    }
+    hits as f64 / (hits + misses) as f64
+}
+
+let filter_hit_rate = calculate_hit_rate(
+    metrics.lookup("dbcache/filter_hit")?.get(),
+    metrics.lookup("dbcache/filter_miss")?.get(),
+);
+
+let block_hit_rate = calculate_hit_rate(
+    metrics.lookup("dbcache/data_block_hit")?.get(),
+    metrics.lookup("dbcache/data_block_miss")?.get(),
+);
+
+let disk_cache_hit_rate = 
+    metrics.lookup("oscache/part_hits")?.get() as f64 /
+    metrics.lookup("oscache/part_access")?.get() as f64;
+```
+
+**Target Hit Rates:**
+- Filter cache: > 90%
+- Index cache: > 90%
+- Data block cache: Varies by workload (50-90%)
+- Object store cache: > 80%
+
+### 2. Monitor Cache Capacity
+
+Track cache utilization to ensure you have adequate capacity:
+
+```rust
+let cache_bytes = metrics.lookup("oscache/cache_bytes")?.get();
+let max_cache_size = 16 * 1024 * 1024 * 1024; // 16 GB
+let utilization = cache_bytes as f64 / max_cache_size as f64;
+
+if utilization > 0.9 {
+    println!("Warning: Cache utilization at {:.1}%", utilization * 100.0);
+}
+```
+
+### 3. Track Eviction Rates
+
+High eviction rates may indicate thrashing:
+
+```rust
+// Calculate evictions per second
+let current_evicted = metrics.lookup("oscache/evicted_keys")?.get();
+std::thread::sleep(std::time::Duration::from_secs(60));
+let new_evicted = metrics.lookup("oscache/evicted_keys")?.get();
+let evictions_per_sec = (new_evicted - current_evicted) as f64 / 60.0;
+
+if evictions_per_sec > 100.0 {
+    println!("Warning: High eviction rate: {:.1}/sec", evictions_per_sec);
+}
+```
+
+### 4. Export to Monitoring Systems
+
+Periodically export metrics to your observability platform:
+
+```rust
+use std::time::Duration;
+use tokio::time::interval;
+
+async fn export_metrics(db: &Db) {
+    let mut ticker = interval(Duration::from_secs(60));
+    
+    loop {
+        ticker.tick().await;
+        
+        let metrics = db.metrics();
+        
+        // Export to your monitoring system (Prometheus, InfluxDB, etc.)
+        for name in metrics.names() {
+            if let Some(stat) = metrics.lookup(name) {
+                // Send to monitoring system
+                send_to_monitoring(name, stat.get());
+            }
+        }
+    }
+}
+```
+
+## Optimizing Cache Performance
+
+### Insufficient Hit Rates
+
+If you're seeing low hit rates:
+
+1. **Increase cache capacity**: Adjust `max_capacity` for DbCache or `max_cache_size_bytes` for object store cache
+2. **Use cache preloading**: Enable `preload_disk_cache_on_startup` in ObjectStoreCacheOptions
+3. **Enable cache_blocks**: Set `cache_blocks: true` in ReadOptions and ScanOptions
+4. **Adjust cache type**: Consider using Foyer's hybrid cache (memory + disk) for larger working sets
+
+### High Eviction Rates
+
+If you're seeing high eviction rates:
+
+1. **Increase cache size**: Expand `max_cache_size_bytes`
+2. **Reduce part size**: Smaller `part_size_bytes` allows more granular caching
+3. **Run compaction**: Reduce the number of SSTs to reduce cache pressure
+
+### Cache Errors
+
+If `dbcache/get_error` is non-zero:
+
+1. **Check logs**: Look for detailed error messages
+2. **Monitor resources**: Ensure sufficient memory and disk space
+3. **Review cache implementation**: Verify custom cache implementations handle errors correctly
+
+## Example: Complete Monitoring Setup
+
+```rust
+use slatedb::{Db, Error};
+use std::time::Duration;
+use tokio::time::interval;
+
+struct CacheMonitor {
+    db: Db,
+}
+
+impl CacheMonitor {
+    fn new(db: Db) -> Self {
+        Self { db }
+    }
+    
+    async fn monitor(&self) {
+        let mut ticker = interval(Duration::from_secs(60));
+        
+        loop {
+            ticker.tick().await;
+            self.report_metrics();
+        }
+    }
+    
+    fn report_metrics(&self) {
+        let metrics = self.db.metrics();
+        
+        // Database cache metrics
+        let filter_hits = metrics.lookup("dbcache/filter_hit").map(|s| s.get()).unwrap_or(0);
+        let filter_misses = metrics.lookup("dbcache/filter_miss").map(|s| s.get()).unwrap_or(0);
+        let index_hits = metrics.lookup("dbcache/index_hit").map(|s| s.get()).unwrap_or(0);
+        let index_misses = metrics.lookup("dbcache/index_miss").map(|s| s.get()).unwrap_or(0);
+        let block_hits = metrics.lookup("dbcache/data_block_hit").map(|s| s.get()).unwrap_or(0);
+        let block_misses = metrics.lookup("dbcache/data_block_miss").map(|s| s.get()).unwrap_or(0);
+        
+        // Object store cache metrics
+        let part_hits = metrics.lookup("oscache/part_hits").map(|s| s.get()).unwrap_or(0);
+        let part_access = metrics.lookup("oscache/part_access").map(|s| s.get()).unwrap_or(0);
+        let cache_keys = metrics.lookup("oscache/cache_keys").map(|s| s.get()).unwrap_or(0);
+        let cache_bytes = metrics.lookup("oscache/cache_bytes").map(|s| s.get()).unwrap_or(0);
+        let evicted_keys = metrics.lookup("oscache/evicted_keys").map(|s| s.get()).unwrap_or(0);
+        
+        println!("=== Cache Statistics ===");
+        println!("Filter cache: {}/{} ({:.1}% hit rate)", 
+            filter_hits, filter_hits + filter_misses,
+            filter_hits as f64 / (filter_hits + filter_misses) as f64 * 100.0);
+        println!("Index cache: {}/{} ({:.1}% hit rate)", 
+            index_hits, index_hits + index_misses,
+            index_hits as f64 / (index_hits + index_misses) as f64 * 100.0);
+        println!("Block cache: {}/{} ({:.1}% hit rate)", 
+            block_hits, block_hits + block_misses,
+            block_hits as f64 / (block_hits + block_misses) as f64 * 100.0);
+        println!("Disk cache: {}/{} ({:.1}% hit rate)", 
+            part_hits, part_access,
+            part_hits as f64 / part_access as f64 * 100.0);
+        println!("Disk cache size: {} keys, {:.2} MB",
+            cache_keys, cache_bytes as f64 / (1024.0 * 1024.0));
+        println!("Total evicted: {} keys", evicted_keys);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = Db::open("my_db", object_store).await?;
+    let monitor = CacheMonitor::new(db);
+    monitor.monitor().await;
+    Ok(())
+}
+```
+
+## See Also
+
+- [Settings](/api/settings) - Configure cache sizes and behavior
+- [Database Statistics](/api/db-stats) - Monitor database operations

@@ -1,0 +1,509 @@
+---
+title: 'Compaction Strategies'
+description: 'Understand and tune compaction for optimal performance'
+---
+
+Compaction is the process of merging multiple SSTables (Sorted String Tables) to reduce space amplification, read amplification, and maintain query performance. SlateDB uses a size-tiered compaction strategy optimized for cloud object storage.
+
+## Why Compaction?
+
+Without compaction, SlateDB would accumulate:
+- **Multiple versions** of the same key from updates
+- **Tombstones** from deletions
+- **Numerous small files** requiring many reads
+
+Compaction addresses these issues by:
+1. Merging files together
+2. Removing old versions and tombstones
+3. Reducing the number of files to search
+
+## SlateDB Architecture
+
+### Storage Levels
+
+SlateDB organizes data into levels:
+
+```
+┌─────────────────┐
+│   Memtable      │ ← Active writes
+└─────────────────┘
+┌─────────────────┐
+│   WAL Files     │ ← Flushed memtables
+└─────────────────┘
+┌─────────────────┐
+│   L0 SSTables   │ ← Compacted from WAL
+└─────────────────┘
+┌─────────────────┐
+│ Sorted Runs     │ ← Compacted L0 + older runs
+│ (SR0, SR1, ...) │
+└─────────────────┘
+```
+
+<Note>
+Each Sorted Run spans the full keyspace and consists of multiple range-partitioned SSTables.
+</Note>
+
+### Write Path
+
+<Steps>
+  <Step title="Write to Memtable">
+    Data is first written to an in-memory memtable and WAL.
+  </Step>
+  
+  <Step title="Flush to WAL">
+    When `flush_interval` expires, WAL is flushed to object storage.
+  </Step>
+  
+  <Step title="Compact to L0">
+    When memtable reaches `l0_sst_size_bytes`, it's compacted to an L0 SSTable.
+  </Step>
+  
+  <Step title="Compact to Sorted Runs">
+    L0 SSTables are periodically compacted with existing Sorted Runs.
+  </Step>
+</Steps>
+
+## Size-Tiered Compaction
+
+SlateDB uses a size-tiered compaction strategy that groups similarly-sized runs together.
+
+### How It Works
+
+The scheduler looks for runs of similar size to compact:
+
+```rust
+// Size-tiered compaction parameters
+min_compaction_sources: 4      // Minimum runs to compact
+max_compaction_sources: 8      // Maximum runs to compact
+include_size_threshold: 4.0    // Size ratio threshold
+```
+
+**Example**: If you have runs of sizes [100MB, 120MB, 110MB, 500MB]:
+- Runs 100MB, 120MB, 110MB are similar (within 4x threshold)
+- 500MB is too large to include
+- Result: Compact the first 3 runs together
+
+### Configuration
+
+Configure size-tiered compaction using scheduler options:
+
+```rust
+use slatedb::config::{Settings, CompactorOptions};
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert(
+    "min_compaction_sources".to_string(),
+    "4".to_string()
+);
+scheduler_options.insert(
+    "max_compaction_sources".to_string(),
+    "8".to_string()
+);
+scheduler_options.insert(
+    "include_size_threshold".to_string(),
+    "4.0".to_string()
+);
+
+let settings = Settings {
+    compactor_options: Some(CompactorOptions {
+        scheduler_options,
+        ..Default::default()
+    }),
+    ..Settings::default()
+};
+```
+
+<Tip>
+- Increase `max_compaction_sources` to reduce write amplification
+- Decrease `include_size_threshold` for more aggressive compaction
+- Balance based on your write/read ratio
+</Tip>
+
+## Compactor Options
+
+### Basic Settings
+
+```rust
+use slatedb::config::CompactorOptions;
+use std::time::Duration;
+
+let options = CompactorOptions {
+    // How often to check for compaction opportunities
+    poll_interval: Duration::from_secs(5),
+    
+    // Maximum size for compacted SSTables
+    max_sst_size: 256 * 1024 * 1024,  // 256MB
+    
+    // Number of concurrent compactions
+    max_concurrent_compactions: 4,
+    
+    // Timeout for manifest updates
+    manifest_update_timeout: Duration::from_secs(300),
+    
+    // Scheduler-specific options
+    scheduler_options: Default::default(),
+};
+```
+
+### Tuning Concurrent Compactions
+
+Control how many compactions run simultaneously:
+
+```rust
+let options = CompactorOptions {
+    // More concurrent compactions for write-heavy workloads
+    max_concurrent_compactions: 8,
+    ..Default::default()
+};
+```
+
+<Warning>
+More concurrent compactions increase network bandwidth usage. Monitor your network utilization when tuning this setting.
+</Warning>
+
+### SSTable Size
+
+Configure the size of compacted SSTables:
+
+```rust
+let options = CompactorOptions {
+    // Smaller SSTables: faster compaction, more files
+    max_sst_size: 128 * 1024 * 1024,  // 128MB
+    
+    // Larger SSTables: fewer files, slower compaction
+    // max_sst_size: 512 * 1024 * 1024,  // 512MB
+    
+    ..Default::default()
+};
+```
+
+## Amplification Factors
+
+### Write Amplification
+
+The total amount of data written for each user write:
+
+```
+Write Amplification = Total Bytes Written / User Bytes Written
+```
+
+**Factors affecting write amplification:**
+- Number of compaction levels
+- Compaction trigger thresholds
+- SSTable sizes
+
+**Reducing write amplification:**
+```rust
+let options = CompactorOptions {
+    // Fewer, larger compactions
+    max_sst_size: 512 * 1024 * 1024,
+    ..Default::default()
+};
+
+let mut scheduler_options = HashMap::new();
+// Compact more runs together at once
+scheduler_options.insert("max_compaction_sources".to_string(), "16".to_string());
+```
+
+### Read Amplification
+
+The number of SSTables checked per read:
+
+```
+Read Amplification = Number of SSTables Checked
+```
+
+**Factors affecting read amplification:**
+- Number of L0 SSTables
+- Number of Sorted Runs
+- Bloom filter effectiveness
+
+**Reducing read amplification:**
+```rust
+let settings = Settings {
+    // More aggressive L0 compaction
+    l0_max_ssts: 4,  // Lower threshold
+    
+    // Better bloom filters
+    filter_bits_per_key: 12,  // Lower false positive rate
+    
+    compactor_options: Some(CompactorOptions {
+        // More frequent compaction
+        poll_interval: Duration::from_secs(2),
+        max_concurrent_compactions: 8,
+        ..Default::default()
+    }),
+    
+    ..Settings::default()
+};
+```
+
+### Space Amplification
+
+The ratio of database size to logical data size:
+
+```
+Space Amplification = Physical Size / Logical Size
+```
+
+**Factors affecting space amplification:**
+- Frequency of compaction
+- Number of versions kept
+- Tombstone retention
+
+<Note>
+SlateDB's space amplification is less critical than disk-based databases because object storage is cheaper and practically unlimited.
+</Note>
+
+## Compaction Triggers
+
+### L0 Compaction
+
+L0 compaction is triggered when:
+
+```rust
+number_of_l0_ssts >= l0_compaction_threshold_ssts
+```
+
+Configure the threshold:
+
+```rust
+let settings = Settings {
+    l0_max_ssts: 8,  // Trigger backpressure
+    ..Settings::default()
+};
+```
+
+### Sorted Run Compaction
+
+Compaction is triggered when the scheduler finds suitable runs based on:
+- Size similarity (`include_size_threshold`)
+- Minimum number of sources (`min_compaction_sources`)
+
+## Backpressure
+
+SlateDB applies backpressure to writes when:
+
+1. **Too many L0 SSTables**: `number_of_l0_ssts >= l0_max_ssts`
+2. **Too much unflushed data**: `unflushed_bytes >= max_unflushed_bytes`
+
+```rust
+let settings = Settings {
+    l0_max_ssts: 8,
+    max_unflushed_bytes: 1_073_741_824,  // 1GB
+    ..Settings::default()
+};
+```
+
+When backpressure is applied:
+- Writes block until compaction catches up
+- Background tasks continue running
+- Database remains available for reads
+
+<Warning>
+Sustained backpressure indicates your compaction settings can't keep up with write throughput. Consider increasing `max_concurrent_compactions` or `max_sst_size`.
+</Warning>
+
+## Compaction Lifecycle
+
+### Compaction Process
+
+<Steps>
+  <Step title="Scheduler Selection">
+    Scheduler identifies candidate runs to compact based on size and count.
+  </Step>
+  
+  <Step title="Job Creation">
+    Compactor creates a compaction job with a unique ULID.
+  </Step>
+  
+  <Step title="Execution">
+    Executor merges SSTables, applies merge operators, and removes tombstones.
+  </Step>
+  
+  <Step title="Manifest Update">
+    New Sorted Run is registered in the manifest, old runs are marked for GC.
+  </Step>
+  
+  <Step title="Garbage Collection">
+    Old SSTables are eventually deleted by the garbage collector.
+  </Step>
+</Steps>
+
+### Monitoring Compaction
+
+Track compaction progress through logs and metrics:
+
+```rust
+// Compaction stats are logged at INFO level
+// Look for messages like:
+// "compaction finished: sources=[...] destination=... bytes_processed=..."
+```
+
+## Workload-Specific Tuning
+
+### Write-Heavy Workloads
+
+Optimize for high write throughput:
+
+```rust
+let settings = Settings {
+    // Larger buffers
+    max_unflushed_bytes: 2 * 1024 * 1024 * 1024,  // 2GB
+    l0_sst_size_bytes: 128 * 1024 * 1024,          // 128MB
+    
+    // Aggressive compaction
+    compactor_options: Some(CompactorOptions {
+        max_concurrent_compactions: 8,
+        max_sst_size: 512 * 1024 * 1024,  // 512MB
+        poll_interval: Duration::from_secs(2),
+        ..Default::default()
+    }),
+    
+    ..Settings::default()
+};
+```
+
+### Read-Heavy Workloads
+
+Optimize for low read amplification:
+
+```rust
+let settings = Settings {
+    // More aggressive L0 compaction
+    l0_max_ssts: 4,
+    
+    // Better bloom filters
+    filter_bits_per_key: 12,
+    min_filter_keys: 500,
+    
+    // Smaller L0 SSTs (less recovery time)
+    l0_sst_size_bytes: 32 * 1024 * 1024,  // 32MB
+    
+    compactor_options: Some(CompactorOptions {
+        max_concurrent_compactions: 6,
+        poll_interval: Duration::from_secs(3),
+        ..Default::default()
+    }),
+    
+    ..Settings::default()
+};
+```
+
+### Balanced Workloads
+
+Balanced configuration for mixed workloads:
+
+```rust
+let settings = Settings {
+    l0_sst_size_bytes: 64 * 1024 * 1024,
+    l0_max_ssts: 8,
+    max_unflushed_bytes: 1_073_741_824,
+    filter_bits_per_key: 10,
+    
+    compactor_options: Some(CompactorOptions {
+        max_concurrent_compactions: 4,
+        max_sst_size: 256 * 1024 * 1024,
+        poll_interval: Duration::from_secs(5),
+        ..Default::default()
+    }),
+    
+    ..Settings::default()
+};
+```
+
+## Manual Compaction
+
+Trigger compaction manually for specific scenarios:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::compactor::CompactionRequest;
+
+// Create admin client
+let admin = AdminBuilder::new(path, object_store).build();
+
+// Trigger full compaction
+admin.submit_compaction(CompactionRequest::Full).await?;
+```
+
+<Note>
+Manual compaction is useful for:
+- Major version upgrades
+- Cleaning up after bulk deletes
+- Preparing for backup/export
+</Note>
+
+## Best Practices
+
+<Steps>
+  <Step title="Start with Defaults">
+    Use default settings initially and monitor performance before tuning.
+  </Step>
+  
+  <Step title="Monitor Metrics">
+    Track write amplification, read amplification, and compaction lag.
+  </Step>
+  
+  <Step title="Tune Gradually">
+    Change one parameter at a time and observe the impact.
+  </Step>
+  
+  <Step title="Consider Workload">
+    Match compaction settings to your read/write ratio and access patterns.
+  </Step>
+  
+  <Step title="Test Under Load">
+    Validate settings under realistic production load before deploying.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### Sustained Backpressure
+
+**Symptoms**: Writes are frequently blocked, high latency
+
+**Solutions**:
+- Increase `max_concurrent_compactions`
+- Increase `max_sst_size` to reduce write amplification
+- Increase `max_unflushed_bytes` for more buffering
+- Verify network bandwidth isn't saturated
+
+### High Read Latency
+
+**Symptoms**: Slow queries, many SSTable reads
+
+**Solutions**:
+- Decrease `l0_max_ssts` for more aggressive compaction
+- Increase `filter_bits_per_key` for better bloom filters
+- Enable disk cache with larger `max_cache_size_bytes`
+- Increase `max_concurrent_compactions`
+
+### High Storage Costs
+
+**Symptoms**: Growing storage usage, slow compaction
+
+**Solutions**:
+- Decrease `poll_interval` for more frequent compaction
+- Increase `max_compaction_sources` to compact more runs at once
+- Configure garbage collection with shorter `min_age`
+- Trigger manual full compaction
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Detailed configuration reference
+  </Card>
+  <Card title="Merge Operators" icon="code-merge" href="/guides/merge-operators">
+    Optimize updates during compaction
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Learn fundamental operations
+  </Card>
+  <Card title="Change Data Capture" icon="stream" href="/guides/change-data-capture">
+    Track changes through WAL
+  </Card>
+</CardGroup>

@@ -1,0 +1,494 @@
+---
+title: "Rust"
+description: "Use SlateDB in Rust applications with the native Rust API"
+---
+
+SlateDB is written in Rust and provides a native, idiomatic Rust API. The Rust crate is the most feature-complete implementation and serves as the foundation for all language bindings.
+
+## Installation
+
+Add SlateDB to your `Cargo.toml`:
+
+```toml
+[dependencies]
+slatedb = "*"
+tokio = { version = "*", features = ["macros", "rt-multi-thread"] }
+```
+
+## Quick Start
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup with in-memory object store
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/test_kv_store", object_store).await?;
+
+    // Put a key-value pair
+    let key = b"test_key";
+    let value = b"test_value";
+    db.put(key, value).await?;
+
+    // Get the value back
+    assert_eq!(
+        db.get(key).await?,
+        Some("test_value".into())
+    );
+
+    // Delete a key
+    db.delete(key).await?;
+    assert!(db.get(key).await?.is_none());
+
+    // Close the database
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+## Object Store Configuration
+
+SlateDB uses the [`object_store`](https://docs.rs/object_store/latest/object_store/) crate and supports any object storage implementing the `ObjectStore` trait.
+
+### In-Memory Store (Testing)
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+let object_store = Arc::new(InMemory::new());
+let db = Db::open("/tmp/db", object_store).await?;
+```
+
+### Amazon S3
+
+```rust
+use object_store::aws::AmazonS3Builder;
+
+let s3 = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-west-2")
+    .build()?;
+
+let db = Db::open("/tmp/db", Arc::new(s3)).await?;
+```
+
+### Azure Blob Storage
+
+```rust
+use object_store::azure::MicrosoftAzureBuilder;
+
+let azure = MicrosoftAzureBuilder::new()
+    .with_account("myaccount")
+    .with_container_name("mycontainer")
+    .build()?;
+
+let db = Db::open("/tmp/db", Arc::new(azure)).await?;
+```
+
+### Google Cloud Storage
+
+```rust
+use object_store::gcp::GoogleCloudStorageBuilder;
+
+let gcs = GoogleCloudStorageBuilder::new()
+    .with_bucket_name("my-bucket")
+    .build()?;
+
+let db = Db::open("/tmp/db", Arc::new(gcs)).await?;
+```
+
+## Basic Operations
+
+### Put
+
+```rust
+// Simple put - awaits durability
+db.put(b"key", b"value").await?;
+
+// Put with options
+use slatedb::config::{PutOptions, WriteOptions};
+
+let put_opts = PutOptions::default()
+    .with_ttl_millis(5000); // 5 second TTL
+
+let write_opts = WriteOptions::default()
+    .with_await_durable(false); // Return immediately
+
+db.put_with_options(b"key", b"value", &put_opts, &write_opts).await?;
+```
+
+### Get
+
+```rust
+// Get returns Option<Bytes>
+if let Some(value) = db.get(b"key").await? {
+    println!("Found: {:?}", value);
+} else {
+    println!("Not found");
+}
+
+// Get with read options
+use slatedb::config::ReadOptions;
+
+let read_opts = ReadOptions::default();
+let value = db.get_with_options(b"key", &read_opts).await?;
+```
+
+### Delete
+
+```rust
+// Simple delete
+db.delete(b"key").await?;
+
+// Delete with options
+let write_opts = WriteOptions::default()
+    .with_await_durable(true);
+
+db.delete_with_options(b"key", &write_opts).await?;
+```
+
+## Range Queries
+
+SlateDB supports efficient range scans using Rust's range syntax:
+
+```rust
+// Unbounded scan (all keys)
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+
+// Bounded range scan
+let mut iter = db.scan(b"key1"..=b"key9").await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+
+// Prefix scan
+let mut iter = db.scan(b"user:"..b"user;" as &[u8]).await?;
+while let Some(kv) = iter.next().await? {
+    // All keys starting with "user:"
+}
+
+// Seek to a specific position
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+iter.seek(b"target_key").await?;
+if let Some(kv) = iter.next().await? {
+    // First key >= "target_key"
+}
+```
+
+## Batch Writes
+
+Batch multiple operations for atomic execution:
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.delete(b"old_key");
+
+// Write atomically
+db.write(batch).await?;
+```
+
+## Transactions
+
+SlateDB supports transactions with configurable isolation levels:
+
+```rust
+use slatedb::IsolationLevel;
+
+// Snapshot Isolation (SI)
+let mut txn = db.begin(IsolationLevel::SnapshotIsolation);
+txn.put(b"key1", b"value1").await?;
+txn.put(b"key2", b"value2").await?;
+
+if let Some(value) = txn.get(b"key1").await? {
+    println!("Value in transaction: {:?}", value);
+}
+
+txn.commit().await?;
+
+// Serializable Snapshot Isolation (SSI)
+let mut txn = db.begin(IsolationLevel::SerializableSnapshotIsolation);
+txn.put(b"counter", b"1").await?;
+txn.commit().await?;
+```
+
+## Snapshots
+
+Create consistent, read-only views of the database:
+
+```rust
+// Create a snapshot
+let snapshot = db.snapshot();
+
+// Reads from snapshot see a consistent view
+let value = snapshot.get(b"key").await?;
+
+// Scan from snapshot
+let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    // Consistent view at snapshot time
+}
+```
+
+## Merge Operators
+
+Define custom merge logic for associative operations:
+
+```rust
+use slatedb::MergeOperator;
+use bytes::Bytes;
+
+struct CounterMerge;
+
+impl MergeOperator for CounterMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &[Bytes],
+    ) -> Result<Option<Bytes>, slatedb::MergeOperatorError> {
+        let mut sum = existing
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        for op in operands {
+            if let Ok(s) = std::str::from_utf8(op) {
+                if let Ok(n) = s.parse::<i64>() {
+                    sum += n;
+                }
+            }
+        }
+
+        Ok(Some(Bytes::from(sum.to_string())))
+    }
+}
+
+// Use with DbBuilder
+use slatedb::DbBuilder;
+
+let db = DbBuilder::new("/tmp/db", object_store)
+    .with_merge_operator(Arc::new(CounterMerge))
+    .build()
+    .await?;
+
+// Apply merge operations
+db.merge(b"counter", b"1").await?;
+db.merge(b"counter", b"5").await?;
+
+assert_eq!(db.get(b"counter").await?, Some("6".into()));
+```
+
+## Configuration
+
+Configure SlateDB using the builder pattern:
+
+```rust
+use slatedb::{DbBuilder, Settings, SstBlockSize};
+
+let settings = Settings::default()
+    .with_flush_interval(Duration::from_millis(100))
+    .with_l0_sst_size_bytes(128 * 1024 * 1024); // 128 MB
+
+let db = DbBuilder::new("/tmp/db", object_store)
+    .with_settings(settings)
+    .with_sst_block_size(SstBlockSize::Kib16)
+    .build()
+    .await?;
+```
+
+### Load Settings from Files
+
+```rust
+use slatedb::config::Settings;
+
+// Load from JSON, TOML, or YAML
+let settings = Settings::load_from_file("config.toml")?;
+
+let db = DbBuilder::new("/tmp/db", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+## Checkpoints
+
+Create durable checkpoints for point-in-time recovery:
+
+```rust
+use slatedb::Checkpoint;
+
+// Create a durable checkpoint
+let result = db.create_checkpoint(Checkpoint::Durable).await?;
+println!("Checkpoint ID: {}", result.id);
+
+// Open a read-only reader at a checkpoint
+use slatedb::DbReaderBuilder;
+
+let reader = DbReaderBuilder::new("/tmp/db", object_store)
+    .with_checkpoint_id(result.id)
+    .build()
+    .await?;
+
+let value = reader.get(b"key").await?;
+reader.close().await?;
+```
+
+## Compaction
+
+Configure and control compaction:
+
+```rust
+use slatedb::CompactorBuilder;
+
+let compactor = CompactorBuilder::new(db.clone())
+    .with_poll_interval(Duration::from_secs(60))
+    .build();
+
+// Compaction runs automatically in background
+// Or trigger manually
+compactor.trigger().await?;
+```
+
+## Garbage Collection
+
+Clean up old data:
+
+```rust
+use slatedb::GarbageCollectorBuilder;
+
+let gc = GarbageCollectorBuilder::new(db.clone())
+    .with_poll_interval(Duration::from_secs(600))
+    .build();
+
+// Runs automatically in background
+```
+
+## Features
+
+SlateDB provides optional Cargo features:
+
+```toml
+[dependencies]
+slatedb = { version = "*", features = ["aws", "azure", "compression"] }
+```
+
+Available features:
+- `aws` - Amazon S3 support (enabled by default)
+- `azure` - Azure Blob Storage support
+- `compression` - Data compression (Snappy)
+- `snappy` - Snappy compression
+- `zlib` - Zlib compression
+- `lz4` - LZ4 compression
+- `zstd` - Zstandard compression
+- `foyer` - Advanced caching (enabled by default)
+- `opendal` - OpenDAL object store integration
+
+## Error Handling
+
+```rust
+use slatedb::{Error, ErrorKind, CloseReason};
+
+match db.get(b"key").await {
+    Ok(Some(value)) => println!("Found: {:?}", value),
+    Ok(None) => println!("Not found"),
+    Err(e) => match e {
+        Error::Closed { reason, .. } => {
+            println!("Database closed: {:?}", reason);
+        }
+        Error::InvalidArgument(msg) => {
+            println!("Invalid argument: {}", msg);
+        }
+        _ => println!("Other error: {:?}", e),
+    }
+}
+```
+
+## Statistics
+
+Monitor database performance:
+
+```rust
+use slatedb::db_stats::DbStats;
+
+let stats = db.stats();
+println!("WAL size: {}", stats.wal_size_bytes());
+println!("Memtable size: {}", stats.memtable_size_bytes());
+
+// Cache statistics
+use slatedb::{db_cache_stats, cached_object_store_stats};
+
+if let Some(cache_stats) = db_cache_stats() {
+    println!("Cache hits: {}", cache_stats.hits());
+    println!("Cache misses: {}", cache_stats.misses());
+}
+```
+
+## Read-Only Access
+
+Open a database in read-only mode:
+
+```rust
+use slatedb::DbReaderBuilder;
+
+let reader = DbReaderBuilder::new("/tmp/db", object_store)
+    .with_manifest_poll_interval(Duration::from_secs(5))
+    .build()
+    .await?;
+
+// Read operations only
+let value = reader.get(b"key").await?;
+let mut iter = reader.scan::<Vec<u8>, _>(..).await?;
+
+reader.close().await?;
+```
+
+## Advanced: Async Runtime
+
+SlateDB requires a Tokio runtime. For multi-threaded applications:
+
+```rust
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Error> {
+    // Your code here
+    Ok(())
+}
+```
+
+For single-threaded applications:
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Error> {
+    // Your code here
+    Ok(())
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="code" href="/api/db">
+    Explore the complete Rust API documentation
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Learn about configuration options
+  </Card>
+  <Card title="Performance Tuning" icon="gauge-high" href="/advanced/performance-tuning">
+    Optimize SlateDB for your workload
+  </Card>
+  <Card title="Examples" icon="flask" href="/examples/overview">
+    See complete working examples
+  </Card>
+</CardGroup>

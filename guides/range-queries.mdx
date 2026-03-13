@@ -1,0 +1,266 @@
+---
+title: 'Range Queries'
+description: 'Efficiently scan and iterate over ranges of keys in SlateDB'
+---
+
+SlateDB supports efficient range queries that allow you to iterate over multiple keys in a sorted order. Range queries are essential for building applications that work with collections of related keys.
+
+## Basic Range Scans
+
+### Scanning All Keys
+
+Iterate over all keys in the database:
+
+```rust
+use slatedb::{Db, Error};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = /* open database */;
+    
+    // Scan all keys (unbounded range)
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+    
+    Ok(())
+}
+```
+
+### Bounded Range Scans
+
+Scan a specific range of keys:
+
+```rust
+// Exclusive end
+let mut iter = db.scan("user:001".."user:999").await?;
+
+// Inclusive end
+let mut iter = db.scan("user:001"..="user:999").await?;
+
+// From a start key to the end
+let mut iter = db.scan("user:001"..).await?;
+
+// From the beginning to an end key
+let mut iter = db.scan(.."user:999").await?;
+```
+
+## Prefix Scans
+
+Scan all keys that share a common prefix:
+
+```rust
+// Scan all keys starting with "user:"
+let mut iter = db.scan_prefix(b"user:").await?;
+
+while let Some(kv) = iter.next().await? {
+    let key = String::from_utf8_lossy(&kv.key);
+    let value = String::from_utf8_lossy(&kv.value);
+    println!("{}: {}", key, value);
+}
+```
+
+### Prefix Scan with Options
+
+```rust
+use slatedb::config::ScanOptions;
+
+let options = ScanOptions {
+    read_ahead_bytes: 8192,  // Read ahead 8KB
+    cache_blocks: true,
+    max_fetch_tasks: 4,      // Parallel fetching
+    ..ScanOptions::default()
+};
+
+let mut iter = db.scan_prefix_with_options(b"session:", &options).await?;
+```
+
+## Scan Options
+
+Customize scan behavior with `ScanOptions`:
+
+```rust
+use slatedb::config::{ScanOptions, DurabilityLevel};
+
+let options = ScanOptions {
+    // Only read durable data from object storage
+    durability_filter: DurabilityLevel::Remote,
+    
+    // Number of bytes to read ahead (rounded to block size)
+    read_ahead_bytes: 16384,  // 16KB
+    
+    // Whether to cache fetched blocks
+    cache_blocks: true,
+    
+    // Max concurrent tasks for fetching blocks
+    max_fetch_tasks: 2,
+    
+    ..ScanOptions::default()
+};
+
+let mut iter = db.scan_with_options("key1".."key9", &options).await?;
+```
+
+<Tip>
+Increase `max_fetch_tasks` for better throughput on large scans, especially when reading from object storage with high latency.
+</Tip>
+
+## Seeking Within Scans
+
+Jump to a specific key within an iterator:
+
+```rust
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+
+// Skip to a specific key
+iter.seek(b"user:500").await?;
+
+// Continue iterating from that point
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}", kv.key);
+}
+```
+
+<Note>
+Seek can only move forward within the original range bounds. You cannot seek backwards or outside the initial range.
+</Note>
+
+## Complete Example
+
+Here's a practical example demonstrating various range query patterns:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use slatedb::config::ScanOptions;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/range_example", object_store).await?;
+    
+    // Insert test data
+    db.put(b"user:alice", b"alice@example.com").await?;
+    db.put(b"user:bob", b"bob@example.com").await?;
+    db.put(b"user:charlie", b"charlie@example.com").await?;
+    db.put(b"product:laptop", b"999.99").await?;
+    db.put(b"product:phone", b"499.99").await?;
+    
+    // Scan all users
+    println!("All users:");
+    let mut iter = db.scan_prefix(b"user:").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("  {}: {}", 
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    
+    // Scan bounded range
+    println!("\nUsers from 'alice' to 'bob':");
+    let mut iter = db.scan(b"user:alice".to_vec()..=b"user:bob".to_vec()).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("  {}: {}", 
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    
+    // Use seek to skip ahead
+    println!("\nAll keys, starting from 'user:charlie':");
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    iter.seek(b"user:charlie").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("  {}: {}", 
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Range Queries in Snapshots
+
+You can also perform range queries on snapshots for consistent reads:
+
+```rust
+// Create a snapshot
+let snapshot = db.snapshot().await?;
+
+// Scan the snapshot
+let mut iter = snapshot.scan(b"key1".to_vec()..b"key9".to_vec()).await?;
+while let Some(kv) = iter.next().await? {
+    // Process key-value pairs from the snapshot
+}
+```
+
+See the [Snapshots guide](/guides/snapshots) for more details.
+
+## Performance Considerations
+
+<Steps>
+  <Step title="Use Prefix Scans">
+    When possible, use `scan_prefix()` instead of unbounded scans to limit the search space.
+  </Step>
+  
+  <Step title="Tune Read-Ahead">
+    Adjust `read_ahead_bytes` based on your access patterns. Larger values reduce round-trips but may waste bandwidth.
+  </Step>
+  
+  <Step title="Enable Parallel Fetching">
+    Increase `max_fetch_tasks` for large scans over high-latency storage backends.
+  </Step>
+  
+  <Step title="Consider Caching">
+    Enable `cache_blocks` for frequently scanned ranges to avoid repeated object storage reads.
+  </Step>
+</Steps>
+
+<Warning>
+Range queries can be expensive if they span many keys. Use bounded ranges and prefix scans to minimize the amount of data scanned.
+</Warning>
+
+## Durability Filters
+
+Control which data is visible in your scans:
+
+```rust
+use slatedb::config::{ScanOptions, DurabilityLevel};
+
+// Only see data that's been flushed to object storage
+let options = ScanOptions {
+    durability_filter: DurabilityLevel::Remote,
+    ..ScanOptions::default()
+};
+let mut iter = db.scan_with_options(b"key1"..b"key9", &options).await?;
+
+// See all data including unflushed writes (default)
+let options = ScanOptions {
+    durability_filter: DurabilityLevel::Memory,
+    ..ScanOptions::default()
+};
+let mut iter = db.scan_with_options(b"key1"..b"key9", &options).await?;
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Create consistent views for range queries
+  </Card>
+  <Card title="Transactions" icon="code-branch" href="/guides/transactions">
+    Scan within transactional contexts
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Optimize scan performance settings
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Learn about point queries and writes
+  </Card>
+</CardGroup>

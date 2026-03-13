@@ -1,0 +1,541 @@
+---
+title: 'DbReader'
+description: 'Read-only interface for accessing a SlateDB database'
+---
+
+## Overview
+
+The `DbReader` provides a read-only interface for accessing a SlateDB database from either the latest persistent state or from an arbitrary checkpoint. It implements the `DbRead` trait, providing all standard read operations without the ability to modify data.
+
+`DbReader` is useful for scenarios where you need:
+- Read-only access to the database
+- Point-in-time reads via checkpoints
+- Separate read workloads from write workloads
+- Multiple concurrent readers
+
+## Creating a DbReader
+
+### builder
+
+```rust
+pub fn builder<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> DbReaderBuilder<P>
+```
+
+Creates a new builder for a database reader at the given path.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database in the object store
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store implementation to use
+</ParamField>
+
+<ResponseField name="DbReaderBuilder" type="DbReaderBuilder<P>">
+  A builder that can be used to configure and build a DbReader
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    
+    // First create a database
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"key1", b"value1").await?;
+    db.close().await?;
+    
+    // Open a reader using the builder pattern
+    let reader = DbReader::builder("test_db", object_store)
+        .build()
+        .await?;
+    
+    let value = reader.get(b"key1").await?;
+    assert_eq!(value, Some(bytes::Bytes::from("value1")));
+    
+    reader.close().await?;
+    Ok(())
+}
+```
+
+---
+
+### open
+
+```rust
+pub async fn open<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+    checkpoint_id: Option<Uuid>,
+    options: DbReaderOptions,
+) -> Result<Self, Error>
+```
+
+Creates a database reader that can read the contents of a database.
+
+The caller can provide an optional checkpoint ID. If provided, the reader will read using the specified checkpoint and will not periodically refresh the checkpoint. Otherwise, the reader creates a new checkpoint pointing to the current manifest and refreshes it periodically.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database in the object store
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store implementation to use
+</ParamField>
+
+<ParamField path="checkpoint_id" type="Option<Uuid>">
+  Optional checkpoint ID for point-in-time reads. If None, reads from the latest state.
+</ParamField>
+
+<ParamField path="options" type="DbReaderOptions" required>
+  Configuration options for the reader
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbReader, Error>">
+  - `Ok(DbReader)` - Successfully created reader
+  - `Err(Error)` - If there was an error opening the reader
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    
+    // Create and write to database
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"key", b"value").await?;
+    db.flush().await?;
+    
+    // Open reader with default options
+    let reader = DbReader::open(
+        "test_db",
+        Arc::clone(&object_store),
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    assert_eq!(reader.get(b"key").await?, Some(bytes::Bytes::from("value")));
+    
+    reader.close().await?;
+    Ok(())
+}
+```
+
+## Read Operations
+
+`DbReader` implements the `DbRead` trait, providing the following methods:
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with default read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  - `Ok(Some(Bytes))` - The value if it exists
+  - `Ok(None)` - If the key does not exist
+  - `Err(Error)` - If there was an error reading
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"key", b"value").await?;
+    db.flush().await?;
+
+    let reader = DbReader::open(
+        "test_db",
+        Arc::clone(&object_store),
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    let value = reader.get(b"key").await?;
+    assert_eq!(value, Some(bytes::Bytes::from("value")));
+    
+    Ok(())
+}
+```
+
+---
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with custom read options.
+
+<Note>
+  For `DbReader`, the `ReadOptions::durability_filter` has no effect since readers can only observe committed state.
+</Note>
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to control the behavior
+</ParamField>
+
+---
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the reader with default read options.
+
+Returns metadata along with the value including sequence number, creation timestamp, and expiration timestamp.
+
+---
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the reader with custom read options.
+
+---
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys using the default scan options.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  An iterator with the results of the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"a", b"a_value").await?;
+    db.put(b"b", b"b_value").await?;
+    db.flush().await?;
+
+    let reader = DbReader::open(
+        "test_db",
+        Arc::clone(&object_store),
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    let mut iter = reader.scan("a".."b").await?;
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"a");
+    assert_eq!(kv.value.as_ref(), b"a_value");
+    assert_eq!(None, iter.next().await?);
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys with custom scan options.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options including read-ahead and caching configuration
+</ParamField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader, config::{DbReaderOptions, ScanOptions}};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"a", b"a_value").await?;
+    db.put(b"b", b"b_value").await?;
+    db.flush().await?;
+
+    let reader = DbReader::open(
+        "test_db",
+        Arc::clone(&object_store),
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    let mut iter = reader.scan_with_options("a".."b", &ScanOptions {
+        read_ahead_bytes: 1024 * 1024,
+        ..ScanOptions::default()
+    }).await?;
+    
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"a");
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix using the default scan options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+---
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix with custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to control the behavior
+</ParamField>
+
+## Lifecycle Management
+
+### close
+
+```rust
+pub async fn close(&self) -> Result<(), Error>
+```
+
+Close the database reader and release resources.
+
+When a reader is opened without a specific checkpoint ID, it creates an internal checkpoint that is periodically refreshed. This method ensures that checkpoint is cleaned up properly.
+
+<ResponseField name="Result" type="Result<(), Error>">
+  - `Ok(())` - Reader closed successfully
+  - `Err(Error)` - If there was an error during cleanup
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store.clone()).await?;
+    
+    let options = DbReaderOptions::default();
+    let reader = DbReader::open("test_db", object_store.clone(), None, options).await?;
+    
+    // Use the reader...
+    
+    reader.close().await?;
+    Ok(())
+}
+```
+
+## Configuration
+
+### DbReaderOptions
+
+```rust
+pub struct DbReaderOptions {
+    pub manifest_poll_interval: Duration,
+    pub checkpoint_lifetime: Duration,
+    pub skip_wal_replay: bool,
+    pub max_memtable_bytes: u64,
+    pub object_store_cache_options: ObjectStoreCacheOptions,
+    pub merge_operator: Option<MergeOperatorType>,
+}
+```
+
+<ParamField path="manifest_poll_interval" type="Duration" default="1s">
+  How frequently the reader polls for manifest updates when not using a specific checkpoint
+</ParamField>
+
+<ParamField path="checkpoint_lifetime" type="Duration" default="300s">
+  How long reader-established checkpoints remain valid. Must be at least 2x the manifest_poll_interval.
+</ParamField>
+
+<ParamField path="skip_wal_replay" type="bool" default="false">
+  If true, skip replaying WAL entries. Only see data flushed to L0 SSTs.
+</ParamField>
+
+<ParamField path="max_memtable_bytes" type="u64" default="1048576">
+  Maximum size in bytes for replayed memtables during WAL replay
+</ParamField>
+
+<ParamField path="object_store_cache_options" type="ObjectStoreCacheOptions">
+  Configuration for object store caching
+</ParamField>
+
+<ParamField path="merge_operator" type="Option<MergeOperatorType>">
+  Optional merge operator for handling merge operations
+</ParamField>
+
+## Checkpoint-Based Reads
+
+`DbReader` supports reading from specific checkpoints for point-in-time consistency:
+
+```rust
+use slatedb::{Db, DbReader, config::{DbReaderOptions, CheckpointOptions, CheckpointScope}};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    
+    // Write initial data
+    db.put(b"key", b"value1").await?;
+    
+    // Create a checkpoint
+    let checkpoint = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions::default()
+    ).await?;
+    
+    // Modify data after checkpoint
+    db.put(b"key", b"value2").await?;
+    
+    // Reader with checkpoint sees old value
+    let reader = DbReader::open(
+        "test_db",
+        Arc::clone(&object_store),
+        Some(checkpoint.id),
+        DbReaderOptions::default(),
+    ).await?;
+    
+    assert_eq!(
+        reader.get(b"key").await?,
+        Some(bytes::Bytes::from("value1"))
+    );
+    
+    // Current DB sees new value
+    assert_eq!(
+        db.get(b"key").await?,
+        Some(bytes::Bytes::from("value2"))
+    );
+    
+    Ok(())
+}
+```
+
+## Usage Notes
+
+<Note>
+  When opening a `DbReader` without a specific checkpoint ID, the reader automatically creates and maintains an internal checkpoint. This checkpoint is refreshed periodically based on `manifest_poll_interval` and is cleaned up when `close()` is called.
+</Note>
+
+<Warning>
+  The `checkpoint_lifetime` must be at least 2x the `manifest_poll_interval`. This ensures the reader has time to refresh the checkpoint before it expires.
+</Warning>
+
+<Info>
+  Setting `skip_wal_replay = true` can improve reader startup performance but will only see data that has been flushed to L0 SSTs, not data that exists only in the WAL.
+</Info>
+
+## Related
+
+- [DbRead Trait](/api/db-read) - Common read operations
+- [DbSnapshot](/api/db-snapshot) - Point-in-time snapshots
+- [DbIterator](/api/db-iterator) - Iterator for scan results

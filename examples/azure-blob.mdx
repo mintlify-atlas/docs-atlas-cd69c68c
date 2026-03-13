@@ -1,0 +1,467 @@
+---
+title: Azure Blob Storage Example
+description: Configure SlateDB to use Azure Blob Storage as the backend object store
+---
+
+## Overview
+
+This example demonstrates how to integrate SlateDB with Azure Blob Storage. SlateDB uses the `object_store` crate's Azure implementation, which provides full compatibility with Azure Blob Storage services.
+
+## Complete Example
+
+```rust
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::{config::PutOptions, Db};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Construct azure blob object store.
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("<REPLACEWITHACCOUNTNAME>")
+            .with_access_key("<REPLACEWITHACCOUNTKEY>")
+            .with_container_name("<REPLACEWITHCONTAINERNAME>")
+            .build()?,
+    );
+
+    println!("Opening the db");
+    let path = "/tmp/slatedb_azure_blob_storage";
+    let db = Db::open(path, blob_store.clone()).await?;
+
+    // Put a value and wait for the flush.
+    println!("Writing a value and waiting for flush");
+    db.put(b"k1", b"value1").await?;
+    println!("{:?}", db.get(b"k1").await?);
+
+    // Put 1000 keys, do not wait for it to be durable
+    println!("Writing 1000 keys without waiting for flush");
+    let write_options = slatedb::config::WriteOptions {
+        await_durable: false,
+    };
+    for i in 0..1000 {
+        db.put_with_options(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+            &PutOptions::default(),
+            &write_options,
+        )
+        .await?;
+    }
+
+    // Flush to make the writes durable.
+    println!("Flushing the writes and closing the db");
+    db.flush().await?;
+    db.close().await?;
+
+    // Reopen the db and read the value.
+    println!("Reopening the db");
+    let db_reopened = Db::open(path, blob_store).await?;
+    println!("Reading the value from the reopened db");
+
+    // Read 20 keys
+    for i in 0..20 {
+        println!(
+            "{:?}",
+            db_reopened.get(format!("key{}", i).as_bytes()).await
+        );
+    }
+    db_reopened.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/azure_blob_storage.rs`
+
+## Prerequisites
+
+### Azure Requirements
+
+1. **Azure Account**: Active Azure subscription
+2. **Storage Account**: Created Azure Storage account
+3. **Access Key**: Storage account access key or connection string
+4. **Container**: Blob container (will be created if it doesn't exist)
+
+### Create Azure Resources
+
+<Steps>
+  <Step title="Create Storage Account">
+    ```bash
+    az storage account create \
+      --name myslatedbaccount \
+      --resource-group myresourcegroup \
+      --location eastus \
+      --sku Standard_LRS
+    ```
+  </Step>
+  
+  <Step title="Get Access Key">
+    ```bash
+    az storage account keys list \
+      --account-name myslatedbaccount \
+      --resource-group myresourcegroup \
+      --query '[0].value' -o tsv
+    ```
+  </Step>
+  
+  <Step title="Create Container">
+    ```bash
+    az storage container create \
+      --name slatedb \
+      --account-name myslatedbaccount \
+      --account-key <your-access-key>
+    ```
+  </Step>
+</Steps>
+
+## Configuration Options
+
+### Using Account Key
+
+The most common configuration method:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("myslatedbaccount")
+        .with_access_key("your-access-key-here")
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+### Using Connection String
+
+Alternatively, use a connection string:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_connection_string("DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=mykey;EndpointSuffix=core.windows.net")
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+### Using Azure AD (Managed Identity)
+
+For production environments using Azure AD authentication:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("myslatedbaccount")
+        .with_use_azure_cli()  // Use Azure CLI credentials
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+### Using Environment Variables
+
+Configure via environment variables:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::from_env()
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+Supported environment variables:
+- `AZURE_STORAGE_ACCOUNT_NAME`
+- `AZURE_STORAGE_ACCOUNT_KEY`
+- `AZURE_STORAGE_CONNECTION_STRING`
+- `AZURE_STORAGE_USE_EMULATOR` (for Azurite)
+
+## Running the Example
+
+### Step 1: Update Configuration
+
+Edit `examples/src/azure_blob_storage.rs` and replace placeholders:
+
+```rust
+.with_account("your-storage-account-name")
+.with_access_key("your-access-key")
+.with_container_name("your-container-name")
+```
+
+### Step 2: Run the Example
+
+```bash
+cd examples
+cargo run --bin azure-blob-storage
+```
+
+### Expected Output
+
+```
+Opening the db
+Writing a value and waiting for flush
+Some([118, 97, 108, 117, 101, 49])
+Writing 1000 keys without waiting for flush
+Flushing the writes and closing the db
+Reopening the db
+Reading the value from the reopened db
+Some([118, 97, 108, 117, 101, 48])
+Some([118, 97, 108, 117, 101, 49])
+...
+```
+
+## Development with Azurite
+
+For local development, use Azurite (Azure Storage Emulator):
+
+### Install and Start Azurite
+
+```bash
+npm install -g azurite
+azurite-blob --location /tmp/azurite
+```
+
+### Configure for Azurite
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_use_emulator(true)
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+Or use the well-known Azurite connection string:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_connection_string(
+            "DefaultEndpointsProtocol=http;\
+             AccountName=devstoreaccount1;\
+             AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;\
+             BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+        )
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+## Key Features Demonstrated
+
+### Asynchronous Writes
+
+Write without waiting for durability:
+
+```rust
+let write_options = slatedb::config::WriteOptions {
+    await_durable: false,
+};
+
+for i in 0..1000 {
+    db.put_with_options(
+        format!("key{}", i).as_bytes(),
+        format!("value{}", i).as_bytes(),
+        &PutOptions::default(),
+        &write_options,
+    )
+    .await?;
+}
+```
+
+This improves throughput by batching writes.
+
+### Manual Flush
+
+Explicitly flush writes to Azure:
+
+```rust
+db.flush().await?;
+```
+
+Use this to ensure durability at specific points.
+
+### Database Persistence
+
+Reopen the database to verify persistence:
+
+```rust
+let db_reopened = Db::open(path, blob_store).await?;
+let value = db_reopened.get(b"k1").await?;
+```
+
+Data is automatically recovered from Azure Blob Storage.
+
+## Advanced Configuration
+
+### Custom Retry Policy
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("myaccount")
+        .with_access_key("mykey")
+        .with_container_name("slatedb")
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_timeout(std::time::Duration::from_secs(60))
+        )
+        .build()?,
+);
+```
+
+### Using Custom Endpoint
+
+For Azure Stack or custom endpoints:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("myaccount")
+        .with_access_key("mykey")
+        .with_container_name("slatedb")
+        .with_endpoint("https://custom.endpoint.com")
+        .build()?,
+);
+```
+
+## Storage Structure
+
+SlateDB organizes data in Azure Blob Storage:
+
+```
+slatedb/                    # Container
+  tmp/
+    slatedb_azure/
+      manifest.json          # Database metadata
+      compacted/
+        00001.sst            # Compacted SST files
+        00002.sst
+      wal/
+        00001.wal            # Write-ahead log
+      checkpoints/           # Checkpoint data
+```
+
+## Performance Considerations
+
+### Throughput
+
+- Azure Blob Storage supports up to 20,000 requests per second per container
+- Use Premium Block Blob Storage for higher IOPS
+- Consider using multiple containers for extreme scale
+
+### Latency
+
+- Typical latency: 10-50ms for operations
+- Use Azure regions close to your compute for lowest latency
+- Enable read access geo-redundant storage (RA-GRS) for multi-region reads
+
+### Cost Optimization
+
+- Use Hot tier for frequently accessed data
+- Use Cool tier for infrequently accessed data
+- Configure lifecycle management policies:
+
+```bash
+az storage account management-policy create \
+  --account-name myslatedbaccount \
+  --policy @policy.json
+```
+
+## Security Best Practices
+
+### Use Azure AD Authentication
+
+Prefer Managed Identity over access keys:
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("myaccount")
+        .with_use_azure_cli()  // Or use MSI in production
+        .with_container_name("slatedb")
+        .build()?,
+);
+```
+
+### Enable Encryption
+
+Azure Storage encrypts data at rest by default. For additional security:
+
+- Enable infrastructure encryption
+- Use customer-managed keys (CMK) with Azure Key Vault
+- Enable secure transfer required (HTTPS only)
+
+### Network Security
+
+```bash
+# Restrict access to specific virtual networks
+az storage account network-rule add \
+  --account-name myslatedbaccount \
+  --vnet-name myvnet \
+  --subnet mysubnet
+```
+
+## Troubleshooting
+
+### Authentication Errors
+
+**Error**: "AuthenticationFailed"
+
+**Solutions**:
+- Verify account name is correct
+- Check access key is valid and not expired
+- Ensure storage account exists in the specified region
+
+### Container Not Found
+
+**Error**: "ContainerNotFound"
+
+**Solutions**:
+- Create the container before running the example
+- Check container name matches exactly (case-sensitive)
+- Verify account has permission to list/create containers
+
+### Network Issues
+
+**Error**: "Failed to connect"
+
+**Solutions**:
+- Check firewall rules allow outbound HTTPS traffic
+- Verify storage account network rules
+- For Azurite, ensure it's running and accessible
+
+### Performance Issues
+
+**Slow operations**:
+
+**Solutions**:
+- Check region latency (use `az network watcher test-ip-flow`)
+- Monitor storage account metrics in Azure Portal
+- Consider upgrading to Premium storage tier
+- Review SlateDB cache configuration
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Google Cloud Storage" icon="google" href="/examples/google-cloud">
+    Use GCS as the backend
+  </Card>
+  <Card title="S3 Storage" icon="aws" href="/examples/s3-storage">
+    Connect to AWS S3
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Optimize database settings
+  </Card>
+  <Card title="Performance Tuning" icon="gauge" href="/advanced/performance-tuning">
+    Maximize throughput and minimize costs
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [object_store Azure documentation](https://docs.rs/object_store/latest/object_store/azure/index.html)
+- [Azure Blob Storage documentation](https://docs.microsoft.com/azure/storage/blobs/)
+- [Azurite emulator](https://docs.microsoft.com/azure/storage/common/storage-use-azurite)
+- [Azure Storage pricing](https://azure.microsoft.com/pricing/details/storage/blobs/)

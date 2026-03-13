@@ -1,0 +1,350 @@
+---
+title: "CompactorBuilder"
+description: "Configure and run standalone compaction processes"
+---
+
+## Overview
+
+The `CompactorBuilder` allows you to run compaction as a separate process, independent from the main database. This is useful for:
+
+- Offloading CPU and I/O intensive compaction work
+- Running compaction on dedicated hardware
+- Scaling compaction independently
+- Reducing resource contention with the main database
+
+## Building a Compactor
+
+### Basic Setup
+
+```rust
+use slatedb::CompactorBuilder;
+use std::sync::Arc;
+
+let compactor = CompactorBuilder::new(
+    "/path/to/db",
+    object_store.clone(),
+    tokio::runtime::Handle::current()
+)
+.build()
+await?;
+```
+
+<ParamField path="path" type="&str" required>
+  The database path in object storage
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for compaction
+</ParamField>
+
+<ParamField path="runtime" type="Handle" required>
+  Tokio runtime handle for spawning tasks
+</ParamField>
+
+## Configuration
+
+### with_compactor_options
+
+Configure compaction behavior:
+
+```rust
+use slatedb::config::CompactorOptions;
+use std::time::Duration;
+
+let options = CompactorOptions {
+    poll_interval: Duration::from_secs(10),
+    max_sst_size: 64 * 1024 * 1024, // 64 MB
+    ..Default::default()
+};
+
+let compactor = CompactorBuilder::new(path, object_store, runtime)
+    .with_compactor_options(options)
+    .build()
+    .await?;
+```
+
+**CompactorOptions Fields:**
+
+<ParamField path="poll_interval" type="Duration">
+  How often to check for compaction work (default: 10s)
+</ParamField>
+
+<ParamField path="max_sst_size" type="usize">
+  Maximum size for output SSTs (default: 64 MB)
+</ParamField>
+
+<ParamField path="min_compaction_age" type="Duration">
+  Minimum age before compacting SSTs (default: 0s)
+</ParamField>
+
+### with_db_cache
+
+Configure caching for the compactor:
+
+```rust
+use slatedb::db_cache::DbCache;
+use std::sync::Arc;
+
+let cache = Arc::new(DbCache::new(/* config */));
+
+let compactor = CompactorBuilder::new(path, object_store, runtime)
+    .with_db_cache(cache)
+    .build()
+    .await?;
+```
+
+### with_merge_operator
+
+Register a merge operator:
+
+```rust
+use std::sync::Arc;
+
+let compactor = CompactorBuilder::new(path, object_store, runtime)
+    .with_merge_operator(Arc::new(CounterMergeOperator))
+    .build()
+    .await?;
+```
+
+<Note>
+  The compactor must use the same merge operator as the main database.
+</Note>
+
+## Running the Compactor
+
+### run_async_task
+
+Run compaction as a background task:
+
+```rust
+use slatedb::CompactorBuilder;
+
+let compactor = CompactorBuilder::new(path, object_store, runtime)
+    .build()
+    .await?;
+
+// Spawn compaction task
+let handle = tokio::spawn(async move {
+    compactor.run_async_task().await
+});
+
+// Compactor runs until stopped
+handle.await??;
+```
+
+<Info>
+  The compactor polls the manifest periodically and runs compaction when needed. It continues running until the task is cancelled or an error occurs.
+</Info>
+
+## Complete Example
+
+```rust
+use slatedb::{Db, CompactorBuilder};
+use slatedb::config::CompactorOptions;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(/* your object store */);
+
+    // Open database without built-in compactor
+    let db = Db::builder("/tmp/db", object_store.clone())
+        .with_compactor_options(None) // Disable built-in compaction
+        .build()
+        .await?;
+
+    // Start standalone compactor
+    let compactor = CompactorBuilder::new(
+        "/tmp/db",
+        object_store.clone(),
+        tokio::runtime::Handle::current()
+    )
+    .with_compactor_options(CompactorOptions {
+        poll_interval: Duration::from_secs(5),
+        max_sst_size: 128 * 1024 * 1024, // 128 MB
+        ..Default::default()
+    })
+    .build()
+    .await?;
+
+    // Run compactor in background
+    let compactor_handle = tokio::spawn(async move {
+        compactor.run_async_task().await
+    });
+
+    // Use database normally
+    for i in 0..1000 {
+        db.put(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes()
+        ).await?;
+    }
+
+    db.close().await?;
+
+    // Stop compactor
+    compactor_handle.abort();
+
+    Ok(())
+}
+```
+
+## Distributed Compaction
+
+Run compaction on a separate machine:
+
+### Machine 1: Database
+
+```rust
+// Run database without compaction
+let db = Db::builder(path, object_store.clone())
+    .with_compactor_options(None)
+    .build()
+    .await?;
+
+// Write data
+db.put(b"key", b"value").await?;
+```
+
+### Machine 2: Compactor
+
+```rust
+// Run only the compactor
+let compactor = CompactorBuilder::new(
+    path,
+    object_store,
+    tokio::runtime::Handle::current()
+)
+.build()
+.await?;
+
+compactor.run_async_task().await?;
+```
+
+<Note>
+  Both processes must have access to the same object storage with appropriate permissions.
+</Note>
+
+## Kubernetes Deployment
+
+Example Kubernetes configuration:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slatedb-compactor
+spec:
+  replicas: 1  # Single compactor per database
+  selector:
+    matchLabels:
+      app: slatedb-compactor
+  template:
+    metadata:
+      labels:
+        app: slatedb-compactor
+    spec:
+      containers:
+      - name: compactor
+        image: your-compactor-image:latest
+        env:
+        - name: DB_PATH
+          value: "/data/mydb"
+        - name: S3_BUCKET
+          value: "my-bucket"
+        - name: AWS_REGION
+          value: "us-east-1"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+```
+
+## Monitoring
+
+The compactor exposes statistics:
+
+```rust
+use slatedb::compactor::stats::CompactionStats;
+
+// Access compaction statistics
+let stats = compactor.stats();
+println!("Bytes compacted: {}", stats.bytes_compacted.load(Ordering::Relaxed));
+println!("Compactions completed: {}", stats.compactions_completed.load(Ordering::Relaxed));
+```
+
+## Health Checks
+
+```rust
+// Check if compactor is healthy
+if compactor.is_running() {
+    println!("Compactor is running");
+}
+```
+
+## Graceful Shutdown
+
+```rust
+use tokio::signal;
+
+let compactor_handle = tokio::spawn(async move {
+    compactor.run_async_task().await
+});
+
+// Wait for shutdown signal
+signal::ctrl_c().await?;
+
+// Stop compactor gracefully
+compactor_handle.abort();
+let _ = compactor_handle.await;
+
+println!("Compactor stopped");
+```
+
+## Best Practices
+
+<Tip>
+  Run exactly one compactor per database. Multiple compactors will conflict and cause errors.
+</Tip>
+
+<Tip>
+  Allocate sufficient CPU and memory for the compactor. Compaction is I/O and CPU intensive.
+</Tip>
+
+<Warning>
+  If the compactor crashes or stops, compaction will not occur and storage space will grow. Monitor compactor health in production.
+</Warning>
+
+<Note>
+  The compactor and database can run on different machines, but they must use the same object storage and configuration.
+</Note>
+
+## Troubleshooting
+
+### Compactor Not Starting
+
+- Verify object storage credentials and permissions
+- Check that the database path exists in object storage
+- Ensure no other compactor is running for the same database
+
+### High CPU Usage
+
+- Increase `poll_interval` to reduce checking frequency
+- Adjust `max_sst_size` to control compaction granularity
+- Reduce write throughput to the database
+
+### Compaction Lag
+
+- Scale up compactor resources (CPU/memory)
+- Check object storage performance and latency
+- Consider tuning compaction parameters
+
+## See Also
+
+- [Compaction Strategies Guide](/guides/compaction-strategies) - Understanding compaction
+- [Standalone Compactor Example](/examples/standalone-compactor) - Complete working example
+- [Configuration](/guides/configuration) - Compactor configuration options

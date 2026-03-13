@@ -1,0 +1,389 @@
+---
+title: 'Transactions'
+description: 'Use transactions for atomic multi-key operations with configurable isolation levels'
+---
+
+SlateDB supports optimistic transactions with two isolation levels: Snapshot Isolation (SI) and Serializable Snapshot Isolation (SSI). Transactions allow you to perform multiple operations atomically with ACID guarantees.
+
+## Transaction Basics
+
+Transactions provide:
+- **Atomicity**: All operations succeed or fail together
+- **Consistency**: Transactions see a consistent view of data
+- **Isolation**: Concurrent transactions don't interfere with each other
+- **Durability**: Committed changes are persistent
+
+### Starting a Transaction
+
+```rust
+use slatedb::{Db, Error, IsolationLevel};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = /* open database */;
+    
+    // Begin transaction with Snapshot Isolation (default)
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    
+    // Perform operations...
+    
+    txn.commit().await?;
+    Ok(())
+}
+```
+
+## Reading in Transactions
+
+### Get Operations
+
+Read values within a transaction:
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Simple get
+if let Some(value) = txn.get(b"user:1").await? {
+    println!("Found: {:?}", value);
+}
+
+// Get with options
+use slatedb::config::ReadOptions;
+let options = ReadOptions::default();
+let value = txn.get_with_options(b"user:1", &options).await?;
+```
+
+### Range Scans
+
+Scan ranges within a transaction:
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Scan a range
+let mut iter = txn.scan("key1".."key9").await?;
+while let Some(kv) = iter.next().await? {
+    // Process keys
+}
+
+// Prefix scan
+let mut iter = txn.scan_prefix(b"user:").await?;
+```
+
+## Writing in Transactions
+
+All write operations are buffered until commit:
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Put
+txn.put(b"account:a", b"600")?;
+txn.put(b"account:b", b"500")?;
+
+// Delete
+txn.delete(b"account:c")?;
+
+// Reads see buffered writes
+assert_eq!(txn.get(b"account:a").await?, Some("600".into()));
+
+// Commit all changes atomically
+txn.commit().await?;
+```
+
+<Note>
+Write operations (`put`, `delete`, `merge`) are synchronous and buffer changes in memory. Only `commit()` is asynchronous and performs I/O.
+</Note>
+
+## Isolation Levels
+
+### Snapshot Isolation (SI)
+
+Snapshot Isolation provides:
+- Consistent snapshot of data at transaction start
+- Detects write-write conflicts
+- No phantom reads
+- May allow write skew anomalies
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Read data
+let balance_a = txn.get(b"account:a").await?;
+let balance_b = txn.get(b"account:b").await?;
+
+// Write data
+txn.put(b"account:a", b"new_balance")?;
+
+// Commit fails if another transaction modified account:a
+txn.commit().await?;
+```
+
+### Serializable Snapshot Isolation (SSI)
+
+SSI adds read-write conflict detection to prevent write skew:
+
+```rust
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+
+// Reads are tracked for conflict detection
+let balance_a = txn.get(b"account:a").await?;
+let balance_b = txn.get(b"account:b").await?;
+
+// Calculate based on reads
+let total: i64 = /* calculate from balance_a and balance_b */;
+
+if total >= 200 {
+    txn.put(b"account:a", b"new_balance")?;
+}
+
+// Commit fails if another transaction modified keys that were read
+txn.commit().await?;
+```
+
+<Warning>
+SSI has higher overhead than SI because it tracks both reads and writes. Use SI unless you need protection against write skew anomalies.
+</Warning>
+
+## Conflict Detection
+
+### Write-Write Conflicts
+
+Both SI and SSI detect write-write conflicts:
+
+```rust
+// Transaction 1
+let txn1 = db.begin(IsolationLevel::Snapshot).await?;
+txn1.put(b"counter", b"1")?;
+
+// Transaction 2 (concurrent)
+let txn2 = db.begin(IsolationLevel::Snapshot).await?;
+txn2.put(b"counter", b"2")?;
+
+// First commit succeeds
+txn1.commit().await?;
+
+// Second commit fails with conflict error
+let result = txn2.commit().await;
+assert!(result.is_err());
+```
+
+### Read-Write Conflicts (SSI only)
+
+SSI detects read-write conflicts:
+
+```rust
+// Transaction 1: Read and write based on read
+let txn1 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let total = compute_total(&txn1).await?;  // Reads multiple keys
+if total >= 200 {
+    txn1.put(b"account:a", b"new_value")?;
+}
+
+// Transaction 2: Modifies a key that txn1 read
+let txn2 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+txn2.put(b"account:b", b"different_value")?;
+txn2.commit().await?;
+
+// Transaction 1 commit fails because account:b was modified
+let result = txn1.commit().await;
+assert!(result.is_err());
+```
+
+## Advanced Features
+
+### Explicit Read Tracking
+
+Mark keys as read even if not actually read:
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Explicitly track reads for conflict detection
+txn.mark_read([b"key1", b"key2", b"key3"])?;
+
+// Now these keys are checked for conflicts on commit
+txn.put(b"key4", b"value")?;
+txn.commit().await?;
+```
+
+<Tip>
+Use `mark_read()` in Snapshot Isolation mode to get selective read-write conflict detection without the overhead of full SSI.
+</Tip>
+
+### Untracked Writes
+
+Exclude certain keys from conflict detection:
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// This write won't cause conflicts with other transactions
+txn.put(b"metrics:counter", b"123")?;
+txn.unmark_write([b"metrics:counter"])?;
+
+// Other writes still participate in conflict detection
+txn.put(b"user:1", b"data")?;
+
+txn.commit().await?;
+```
+
+<Note>
+Unmarked writes are still applied atomically, they just don't trigger conflicts. Useful for counters and metrics that don't need strict consistency.
+</Note>
+
+## Transaction Examples
+
+### Bank Transfer Example
+
+A classic example demonstrating atomic operations:
+
+```rust
+use slatedb::{Db, Error, IsolationLevel};
+
+async fn transfer(
+    db: &Db,
+    from: &[u8],
+    to: &[u8],
+    amount: i64,
+) -> Result<(), Error> {
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    
+    // Read current balances
+    let from_balance: i64 = txn.get(from).await?
+        .map(|v| String::from_utf8_lossy(&v).parse().unwrap())
+        .unwrap_or(0);
+    
+    let to_balance: i64 = txn.get(to).await?
+        .map(|v| String::from_utf8_lossy(&v).parse().unwrap())
+        .unwrap_or(0);
+    
+    // Check sufficient funds
+    if from_balance < amount {
+        return Err(Error::from(slatedb::SlateDBError::InvalidArgument(
+            "Insufficient funds".to_string()
+        )));
+    }
+    
+    // Perform transfer
+    txn.put(from, (from_balance - amount).to_string().as_bytes())?;
+    txn.put(to, (to_balance + amount).to_string().as_bytes())?;
+    
+    // Commit atomically
+    txn.commit().await?;
+    Ok(())
+}
+```
+
+### Conditional Update Example
+
+```rust
+async fn increment_if_below_limit(
+    db: &Db,
+    key: &[u8],
+    limit: i64,
+) -> Result<bool, Error> {
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    
+    // Read current value
+    let current: i64 = txn.get(key).await?
+        .map(|v| String::from_utf8_lossy(&v).parse().unwrap())
+        .unwrap_or(0);
+    
+    if current < limit {
+        // Update value
+        txn.put(key, (current + 1).to_string().as_bytes())?;
+        txn.commit().await?;
+        Ok(true)
+    } else {
+        // Don't update, rollback is automatic
+        Ok(false)
+    }
+}
+```
+
+## Commit Options
+
+Customize commit behavior:
+
+```rust
+use slatedb::config::WriteOptions;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+
+// Commit with custom options
+let write_opts = WriteOptions {
+    await_durable: false,  // Don't wait for durability
+    ..Default::default()
+};
+
+if let Some(handle) = txn.commit_with_options(&write_opts).await? {
+    // Write was successful
+    println!("Transaction committed");
+}
+```
+
+## Error Handling
+
+Handle transaction conflicts:
+
+```rust
+use slatedb::{Error, ErrorKind};
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+
+match txn.commit().await {
+    Ok(_) => println!("Transaction committed"),
+    Err(e) => {
+        match e.kind() {
+            ErrorKind::TransactionConflict => {
+                println!("Conflict detected, retry transaction");
+                // Retry logic here
+            }
+            _ => return Err(e),
+        }
+    }
+}
+```
+
+<Warning>
+Transactions automatically rollback when dropped without calling commit(). Always explicitly commit or rollback transactions.
+</Warning>
+
+## Best Practices
+
+<Steps>
+  <Step title="Keep Transactions Short">
+    Minimize the time between begin() and commit() to reduce conflicts.
+  </Step>
+  
+  <Step title="Choose the Right Isolation Level">
+    Use Snapshot Isolation unless you need SSI's stronger guarantees.
+  </Step>
+  
+  <Step title="Handle Conflicts Gracefully">
+    Implement retry logic for conflict errors with exponential backoff.
+  </Step>
+  
+  <Step title="Batch Related Operations">
+    Group related operations in a single transaction for atomicity.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Merge Operators" icon="code-merge" href="/guides/merge-operators">
+    Learn about conflict-free updates
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Create read-only consistent views
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Review fundamental operations
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Tune transaction performance
+  </Card>
+</CardGroup>

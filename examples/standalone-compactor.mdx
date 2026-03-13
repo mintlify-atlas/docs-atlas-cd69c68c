@@ -1,0 +1,590 @@
+---
+title: Standalone Compactor Example
+description: Run SlateDB compaction as a separate process for scalable, distributed deployments
+---
+
+## Overview
+
+By default, SlateDB runs compaction as an embedded background task within the database process. However, for distributed systems or when you want to isolate resource-intensive compaction work, you can run the compactor as a standalone process.
+
+This example demonstrates how to:
+- Disable the embedded compactor in your database
+- Run compaction as a separate, independent process
+- Coordinate between multiple database instances and a single compactor
+
+## Architecture
+
+In a standalone compactor setup:
+
+```
+┌─────────────┐
+│  DB Writer  │────┐
+│ (no compactor) │
+└─────────────┘    │
+                   │
+┌─────────────┐    │    ┌──────────────────┐
+│  DB Writer  │────┼───▶│ Object Storage   │
+│ (no compactor) │    │    │  (S3/GCS/Azure)  │
+└─────────────┘    │    └──────────────────┘
+                   │              ▲
+┌─────────────┐    │              │
+│  DB Writer  │────┘              │
+│ (no compactor) │                │
+└─────────────┘                   │
+                                  │
+                         ┌────────┴────────┐
+                         │   Standalone    │
+                         │   Compactor     │
+                         └─────────────────┘
+```
+
+## Complete Examples
+
+### Database Without Embedded Compactor
+
+```rust
+use slatedb::config::Settings;
+use slatedb::object_store::local::LocalFileSystem;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // This example uses a local object store so it can be shared with a separate
+    // compactor process. In production, this could also be an object store like S3.
+    let local_root = std::env::temp_dir().join("slatedb-standalone-compactor-tutorial");
+    std::fs::create_dir_all(&local_root)?;
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(local_root)?);
+
+    // Disable the embedded compactor by clearing compactor options.
+    let settings = Settings {
+        compactor_options: None,
+        ..Default::default()
+    };
+
+    let db = Db::builder("db", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+
+    db.put(b"hello", b"world").await?;
+    db.flush().await?;
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/db_without_compactor.rs`
+
+### Standalone Compactor Process
+
+```rust
+use slatedb::object_store::local::LocalFileSystem;
+use slatedb::CompactorBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let local_root = std::env::temp_dir().join("slatedb-standalone-compactor-tutorial");
+    std::fs::create_dir_all(&local_root)?;
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(local_root)?);
+
+    // Build a compactor without opening a Db. The database must already exist (i.e.
+    // the manifest has been created).
+    let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+
+    println!("Compactor running. Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c().await?;
+
+    compactor.stop().await?;
+    compactor_task.await??;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/standalone_compactor.rs`
+
+## Prerequisites
+
+### System Requirements
+
+- Rust 1.70 or later
+- Shared object storage accessible by all processes
+- Tokio async runtime
+
+### Database Must Exist
+
+<Warning>
+  The standalone compactor requires an existing database. You must create the database with at least one writer before starting the compactor.
+</Warning>
+
+The database must have:
+- Created manifest file
+- Initialized metadata
+- At least one successful write (optional but recommended)
+
+## Running the Example
+
+### Step 1: Create Database Without Compactor
+
+```bash
+cd examples
+cargo run --bin db-without-compactor
+```
+
+This creates the database and writes initial data without starting a compactor.
+
+### Step 2: Start Standalone Compactor
+
+In a separate terminal:
+
+```bash
+cd examples
+cargo run --bin standalone-compactor
+```
+
+Output:
+```
+Compactor running. Press Ctrl-C to stop.
+```
+
+The compactor will:
+- Monitor the manifest for changes
+- Trigger compaction when thresholds are met
+- Merge SST files in the background
+- Update the manifest atomically
+
+### Step 3: Write More Data
+
+Run the database writer again or use your application:
+
+```bash
+cargo run --bin db-without-compactor
+```
+
+The standalone compactor will automatically detect and compact the new data.
+
+## Configuration
+
+### Disable Embedded Compactor
+
+To disable compaction in the database process:
+
+```rust
+use slatedb::config::Settings;
+
+let settings = Settings {
+    compactor_options: None,
+    ..Default::default()
+};
+
+let db = Db::builder(path, object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+### Customize Compactor Behavior
+
+For the standalone compactor, you can customize its behavior:
+
+```rust
+use slatedb::{CompactorBuilder, config::CompactorOptions};
+use std::time::Duration;
+
+let compactor_options = CompactorOptions {
+    poll_interval: Duration::from_secs(60),
+    max_sst_size: 64 * 1024 * 1024,  // 64MB
+    ..Default::default()
+};
+
+let compactor = Arc::new(
+    CompactorBuilder::new("db", object_store)
+        .with_options(compactor_options)
+        .build()
+);
+```
+
+### Production Configuration
+
+For production deployments with cloud storage:
+
+```rust
+use object_store::aws::AmazonS3Builder;
+use slatedb::CompactorBuilder;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Use S3 instead of local filesystem
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_access_key_id(std::env::var("AWS_ACCESS_KEY_ID")?)
+            .with_secret_access_key(std::env::var("AWS_SECRET_ACCESS_KEY")?)
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let compactor = Arc::new(
+        CompactorBuilder::new("production-db", object_store).build()
+    );
+
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+
+    // Handle shutdown gracefully
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down compactor...");
+    
+    compactor.stop().await?;
+    compactor_task.await??;
+    
+    println!("Compactor stopped successfully");
+    Ok(())
+}
+```
+
+## Use Cases
+
+### Distributed Write-Heavy Systems
+
+Multiple writers with a single compactor:
+
+```rust
+// Writer instance 1, 2, 3, ...
+let db = Db::builder("shared-db", s3_store.clone())
+    .with_settings(Settings {
+        compactor_options: None,
+        ..Default::default()
+    })
+    .build()
+    .await?;
+
+// Separate compactor instance
+let compactor = CompactorBuilder::new("shared-db", s3_store)
+    .build();
+```
+
+Benefits:
+- Writers don't compete for compaction resources
+- Compactor can run on larger instances
+- Easier to scale writers independently
+
+### Resource Isolation
+
+Separate compaction from latency-sensitive operations:
+
+```rust
+// Latency-sensitive writer
+let writer_settings = Settings {
+    compactor_options: None,  // No CPU/memory used for compaction
+    ..Default::default()
+};
+
+// Run compactor on dedicated instance with more resources
+let compactor = CompactorBuilder::new("db", object_store)
+    .build();
+```
+
+### Maintenance Windows
+
+Run compaction only during off-peak hours:
+
+```rust
+use tokio::time::{interval, Duration};
+
+let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+
+loop {
+    // Wait until maintenance window
+    wait_for_maintenance_window().await;
+    
+    // Run compaction
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+    
+    // Stop after maintenance window
+    wait_for_maintenance_end().await;
+    compactor.stop().await?;
+    compactor_task.await??;
+}
+```
+
+## Monitoring and Management
+
+### Health Checks
+
+Monitor compactor health:
+
+```rust
+use tokio::time::{interval, Duration};
+
+let mut health_check = interval(Duration::from_secs(30));
+
+loop {
+    health_check.tick().await;
+    
+    // Check if compactor task is still running
+    if compactor_task.is_finished() {
+        eprintln!("Compactor task terminated unexpectedly");
+        // Restart or alert
+    }
+}
+```
+
+### Graceful Shutdown
+
+Handle shutdown signals properly:
+
+```rust
+use tokio::signal;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+    
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+    
+    // Wait for SIGTERM or SIGINT
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            println!("Received Ctrl-C, shutting down...");
+        }
+        result = compactor_task => {
+            println!("Compactor exited: {:?}", result);
+        }
+    }
+    
+    compactor.stop().await?;
+    Ok(())
+}
+```
+
+### Logging and Metrics
+
+Add observability:
+
+```rust
+use tracing::{info, warn, error};
+use tracing_subscriber;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+    
+    info!("Starting standalone compactor");
+    
+    let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+    
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move {
+            match compactor.run().await {
+                Ok(_) => info!("Compactor completed successfully"),
+                Err(e) => error!("Compactor failed: {}", e),
+            }
+        })
+    };
+    
+    tokio::signal::ctrl_c().await?;
+    info!("Shutdown signal received");
+    
+    compactor.stop().await?;
+    compactor_task.await?;
+    
+    info!("Compactor stopped cleanly");
+    Ok(())
+}
+```
+
+## Deployment Patterns
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slatedb-compactor
+spec:
+  replicas: 1  # Only one compactor instance
+  selector:
+    matchLabels:
+      app: slatedb-compactor
+  template:
+    metadata:
+      labels:
+        app: slatedb-compactor
+    spec:
+      containers:
+      - name: compactor
+        image: myapp/slatedb-compactor:latest
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: access-key-id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: secret-access-key
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  compactor:
+    build: .
+    command: /app/standalone-compactor
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=us-east-1
+    restart: unless-stopped
+    
+  writer:
+    build: .
+    command: /app/writer
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=us-east-1
+    depends_on:
+      - compactor
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Run Only One Compactor">
+    Only one compactor should run per database path. Multiple compactors can conflict and cause issues.
+  </Accordion>
+  
+  <Accordion title="Create Database First">
+    Always create the database with at least one writer before starting the standalone compactor.
+  </Accordion>
+  
+  <Accordion title="Monitor Compactor Health">
+    Implement health checks and alerting to detect compactor failures quickly.
+  </Accordion>
+  
+  <Accordion title="Use Shared Storage">
+    Ensure all writers and the compactor use the same object storage backend and path prefix.
+  </Accordion>
+  
+  <Accordion title="Handle Shutdown Gracefully">
+    Always call `compactor.stop().await` before terminating to ensure clean shutdown.
+  </Accordion>
+  
+  <Accordion title="Resource Allocation">
+    Allocate sufficient CPU and memory to the compactor, especially for write-heavy workloads.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+### Compactor Won't Start
+
+**Error**: "Manifest not found"
+
+**Solution**: Create the database first by running at least one writer with an initialized database.
+
+### Compaction Not Happening
+
+**Symptoms**: SST files accumulating without being compacted
+
+**Solutions**:
+- Verify compactor is running: check process/container status
+- Check compactor logs for errors
+- Ensure compactor has read/write access to object storage
+- Verify manifest permissions
+
+### Multiple Compactors Running
+
+**Symptoms**: Manifest conflicts, inconsistent state
+
+**Solutions**:
+- Ensure only one compactor instance per database
+- Use orchestration (Kubernetes) to maintain single replica
+- Check for zombie processes from previous runs
+
+### High Memory Usage
+
+**Symptoms**: Compactor consuming excessive memory
+
+**Solutions**:
+- Reduce `max_sst_size` in compactor options
+- Increase compactor instance memory
+- Tune compaction triggers and thresholds
+
+## Performance Considerations
+
+### CPU and Memory
+
+- Compaction is CPU and memory intensive
+- Allocate at least 1-2 CPU cores
+- Memory usage proportional to SST file sizes
+- Consider running on larger instance types
+
+### Network Bandwidth
+
+- Compaction reads and writes to object storage
+- Bandwidth requirements scale with write throughput
+- Co-locate compactor and object storage when possible
+
+### Compaction Frequency
+
+- More frequent compaction: lower read latency, higher cost
+- Less frequent: higher read latency, lower cost
+- Tune `poll_interval` based on workload
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration Guide" icon="sliders" href="/guides/configuration">
+    Customize compaction settings
+  </Card>
+  <Card title="Compaction Strategies" icon="layer-group" href="/guides/compaction-strategies">
+    Understand compaction algorithms
+  </Card>
+  <Card title="Performance Tuning" icon="gauge" href="/advanced/performance-tuning">
+    Optimize for your workload
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Debug common issues
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [CompactorBuilder API](/api/compactor)
+- [Configuration reference](/api/settings)
+- [Compaction concepts](/concepts/compaction)
+- [Production deployment guide](/guides/configuration)

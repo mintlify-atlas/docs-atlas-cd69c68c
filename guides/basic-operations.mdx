@@ -1,0 +1,263 @@
+---
+title: 'Basic Operations'
+description: 'Learn how to perform basic read and write operations in SlateDB'
+---
+
+SlateDB provides a simple key-value API for reading and writing data. All operations are asynchronous and support custom options for fine-grained control.
+
+## Opening a Database
+
+Before performing any operations, you need to open a database connection with an object store backend:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/my_db", object_store).await?;
+    
+    // Perform operations...
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+<Note>
+SlateDB is cloud-native and stores data in object storage (S3, GCS, Azure Blob). The `InMemory` store is useful for testing and development.
+</Note>
+
+## Writing Data
+
+### Put Operation
+
+Store a key-value pair in the database:
+
+```rust
+// Simple put
+db.put(b"user:1", b"alice").await?;
+
+// The write is durable by default
+let handle = db.put(b"user:2", b"bob").await?;
+```
+
+### Put with Options
+
+Customize write behavior using `PutOptions` and `WriteOptions`:
+
+```rust
+use slatedb::config::{PutOptions, WriteOptions, Ttl};
+use std::time::Duration;
+
+// Set a time-to-live (TTL) for the key
+let put_opts = PutOptions {
+    ttl: Ttl::ExpireAfter(Duration::from_secs(3600).as_millis() as u64),
+};
+
+let write_opts = WriteOptions {
+    await_durable: true,  // Wait for durability (default)
+    ..Default::default()
+};
+
+db.put_with_options(
+    b"session:abc",
+    b"user_data",
+    &put_opts,
+    &write_opts
+).await?;
+```
+
+<Tip>
+By default, writes block until data is durably committed to object storage. Set `await_durable: false` for lower latency if you don't need immediate durability guarantees.
+</Tip>
+
+## Reading Data
+
+### Get Operation
+
+Retrieve a value by its key:
+
+```rust
+match db.get(b"user:1").await? {
+    Some(value) => println!("Found: {:?}", value),
+    None => println!("Key not found"),
+}
+```
+
+### Get with Options
+
+Control read behavior using `ReadOptions`:
+
+```rust
+use slatedb::config::{ReadOptions, DurabilityLevel};
+
+let options = ReadOptions {
+    durability_filter: DurabilityLevel::Remote,  // Only read durable data
+    cache_blocks: true,  // Enable block caching
+    ..Default::default()
+};
+
+let value = db.get_with_options(b"user:1", &options).await?;
+```
+
+### Get Key-Value with Metadata
+
+Retrieve both the value and metadata (sequence number, timestamps):
+
+```rust
+if let Some(kv) = db.get_key_value(b"user:1").await? {
+    println!("Key: {:?}", kv.key);
+    println!("Value: {:?}", kv.value);
+    println!("Sequence: {}", kv.seq);
+    println!("Created: {:?}", kv.create_ts);
+    println!("Expires: {:?}", kv.expire_ts);
+}
+```
+
+## Deleting Data
+
+### Delete Operation
+
+Remove a key from the database:
+
+```rust
+db.delete(b"user:1").await?;
+
+// Verify deletion
+assert!(db.get(b"user:1").await?.is_none());
+```
+
+### Delete with Options
+
+```rust
+use slatedb::config::WriteOptions;
+
+let options = WriteOptions {
+    await_durable: false,  // Don't wait for durability
+    ..Default::default()
+};
+
+db.delete_with_options(b"user:2", &options).await?;
+```
+
+## Batch Operations
+
+Group multiple operations into an atomic batch for better performance:
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"user:1", b"alice");
+batch.put(b"user:2", b"bob");
+batch.delete(b"user:3");
+batch.put(b"user:4", b"charlie");
+
+// All operations are applied atomically
+db.write(batch).await?;
+```
+
+<Warning>
+Batch writes block other operations until the entire batch is written to the WAL (or memtable if WAL is disabled). Keep batches reasonably sized for better concurrency.
+</Warning>
+
+## Flushing Data
+
+Explicitly flush in-memory writes to object storage:
+
+```rust
+// Flush with default options
+db.flush().await?;
+```
+
+With custom flush options:
+
+```rust
+use slatedb::config::{FlushOptions, FlushType};
+
+// Flush WAL to object storage
+let options = FlushOptions {
+    flush_type: FlushType::Wal,
+};
+db.flush_with_options(options).await?;
+
+// Or flush memtable to L0
+let options = FlushOptions {
+    flush_type: FlushType::MemTable,
+};
+db.flush_with_options(options).await?;
+```
+
+## Closing the Database
+
+Always close the database when you're done:
+
+```rust
+db.close().await?;
+```
+
+<Note>
+Closing the database flushes outstanding writes and shuts down background tasks gracefully.
+</Note>
+
+## Complete Example
+
+Here's a complete example demonstrating basic operations:
+
+```rust
+use slatedb::{Db, Error, WriteBatch};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Open database
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/test_db", object_store).await?;
+
+    // Write data
+    db.put(b"key1", b"value1").await?;
+    
+    // Read data
+    assert_eq!(db.get(b"key1").await?, Some("value1".into()));
+    
+    // Delete data
+    db.delete(b"key1").await?;
+    assert!(db.get(b"key1").await?.is_none());
+    
+    // Batch operations
+    let mut batch = WriteBatch::new();
+    batch.put(b"test_key1", b"test_value1");
+    batch.put(b"test_key2", b"test_value2");
+    batch.put(b"test_key3", b"test_value3");
+    db.write(batch).await?;
+    
+    // Flush to storage
+    db.flush().await?;
+    
+    // Close database
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Range Queries" icon="arrows-left-right" href="/guides/range-queries">
+    Learn how to scan ranges of keys efficiently
+  </Card>
+  <Card title="Transactions" icon="code-branch" href="/guides/transactions">
+    Use transactions for atomic multi-key operations
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Tune SlateDB for your workload
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Create consistent point-in-time views
+  </Card>
+</CardGroup>

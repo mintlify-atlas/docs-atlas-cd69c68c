@@ -1,0 +1,369 @@
+---
+title: "GarbageCollectorBuilder"
+description: "Configure and run garbage collection to clean up obsolete data"
+---
+
+## Overview
+
+The `GarbageCollectorBuilder` creates a garbage collector that removes obsolete data from SlateDB:
+
+- **Write-ahead log (WAL) SSTs** no longer referenced by manifests
+- **Compacted SSTs** replaced by newer compactions
+- **Old compaction metadata** no longer needed
+- **Old manifests** not needed for recovery or checkpoints
+
+Garbage collection is essential for managing storage costs and preventing unbounded growth.
+
+## Building a Garbage Collector
+
+### Basic Setup
+
+```rust
+use slatedb::GarbageCollectorBuilder;
+use std::sync::Arc;
+
+let gc = GarbageCollectorBuilder::new(
+    "/path/to/db",
+    object_store.clone()
+)
+.build()
+.await?;
+```
+
+<ParamField path="path" type="&str" required>
+  The database path in object storage
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to scan for garbage
+</ParamField>
+
+## Configuration
+
+### with_options
+
+Configure garbage collection behavior:
+
+```rust
+use slatedb::config::{
+    GarbageCollectorOptions,
+    GcResourceOptions,
+};
+use std::time::Duration;
+
+let options = GarbageCollectorOptions {
+    wal_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(600)), // 10 minutes
+        interval: Some(Duration::from_secs(60)),  // Check every minute
+    }),
+    compacted_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(300)),  // 5 minutes
+        interval: Some(Duration::from_secs(120)), // Check every 2 minutes
+    }),
+    manifest_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(3600)), // 1 hour
+        interval: Some(Duration::from_secs(300)), // Check every 5 minutes
+    }),
+    ..Default::default()
+};
+
+let gc = GarbageCollectorBuilder::new(path, object_store)
+    .with_options(options)
+    .build()
+    .await?;
+```
+
+**GcResourceOptions Fields:**
+
+<ParamField path="min_age" type="Duration">
+  Minimum age before deleting (default: 5 minutes)
+</ParamField>
+
+<ParamField path="interval" type="Duration">
+  How often to run GC for this resource (default: 1 minute)
+</ParamField>
+
+<Warning>
+  Set `min_age` appropriately to avoid deleting files still in use. The default of 5 minutes is conservative for most deployments.
+</Warning>
+
+## Running the Garbage Collector
+
+### run_async_task
+
+Run garbage collection continuously:
+
+```rust
+let gc = GarbageCollectorBuilder::new(path, object_store)
+    .build()
+    .await?;
+
+let gc_handle = tokio::spawn(async move {
+    gc.run_async_task().await
+});
+
+// GC runs until stopped
+gc_handle.await??;
+```
+
+### run_gc_once
+
+Run a single garbage collection pass:
+
+```rust
+let gc = GarbageCollectorBuilder::new(path, object_store)
+    .build()
+    .await?;
+
+// Run GC once and return
+gc.run_gc_once().await?;
+```
+
+<Note>
+  Use `run_gc_once()` for scheduled/cron-style garbage collection instead of a continuous background task.
+</Note>
+
+## Complete Example
+
+```rust
+use slatedb::{Db, GarbageCollectorBuilder};
+use slatedb::config::{
+    GarbageCollectorOptions,
+    GcResourceOptions,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(/* your object store */);
+
+    // Open database
+    let db = Db::open("/tmp/db", object_store.clone()).await?;
+
+    // Write and compact data
+    for i in 0..10000 {
+        db.put(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes()
+        ).await?;
+    }
+    db.flush().await?;
+
+    // Build garbage collector
+    let gc = GarbageCollectorBuilder::new(
+        "/tmp/db",
+        object_store.clone()
+    )
+    .with_options(GarbageCollectorOptions {
+        wal_options: Some(GcResourceOptions {
+            min_age: Some(Duration::from_secs(300)),
+            interval: Some(Duration::from_secs(60)),
+        }),
+        compacted_options: Some(GcResourceOptions {
+            min_age: Some(Duration::from_secs(300)),
+            interval: Some(Duration::from_secs(120)),
+        }),
+        manifest_options: Some(GcResourceOptions {
+            min_age: Some(Duration::from_secs(600)),
+            interval: Some(Duration::from_secs(300)),
+        }),
+        compactions_options: Some(GcResourceOptions {
+            min_age: Some(Duration::from_secs(600)),
+            interval: Some(Duration::from_secs(300)),
+        }),
+    })
+    .build()
+    .await?;
+
+    // Run GC in background
+    let gc_handle = tokio::spawn(async move {
+        gc.run_async_task().await
+    });
+
+    // Continue using database
+    tokio::time::sleep(Duration::from_secs(600)).await;
+
+    db.close().await?;
+
+    // Stop GC
+    gc_handle.abort();
+
+    Ok(())
+}
+```
+
+## GC Resource Types
+
+### WAL Garbage Collection
+
+Cleans up write-ahead log SSTs:
+
+```rust
+let options = GarbageCollectorOptions {
+    wal_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(600)),
+        interval: Some(Duration::from_secs(60)),
+    }),
+    ..Default::default()
+};
+```
+
+<Info>
+  WAL SSTs are safe to delete once they've been flushed to L0 and the manifest has been updated.
+</Info>
+
+### Compacted SST Garbage Collection
+
+Removes SSTs replaced by compaction:
+
+```rust
+let options = GarbageCollectorOptions {
+    compacted_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(300)),
+        interval: Some(Duration::from_secs(120)),
+    }),
+    ..Default::default()
+};
+```
+
+<Note>
+  Checkpoints may reference old SSTs. The GC automatically preserves SSTs needed by active checkpoints.
+</Note>
+
+### Manifest Garbage Collection
+
+Cleans up old manifest files:
+
+```rust
+let options = GarbageCollectorOptions {
+    manifest_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(3600)),
+        interval: Some(Duration::from_secs(300)),
+    }),
+    ..Default::default()
+};
+```
+
+<Warning>
+  Set a longer `min_age` for manifests (1+ hours) to ensure recovery points are preserved.
+</Warning>
+
+### Compactions Metadata GC
+
+Removes old compaction metadata files:
+
+```rust
+let options = GarbageCollectorOptions {
+    compactions_options: Some(GcResourceOptions {
+        min_age: Some(Duration::from_secs(600)),
+        interval: Some(Duration::from_secs(300)),
+    }),
+    ..Default::default()
+};
+```
+
+## Monitoring
+
+Access GC statistics:
+
+```rust
+use slatedb::garbage_collector_stats;
+use std::sync::atomic::Ordering;
+
+let stats = garbage_collector_stats();
+println!("WAL SSTs deleted: {}", 
+    stats.wal_ssts_deleted.load(Ordering::Relaxed));
+println!("Compacted SSTs deleted: {}", 
+    stats.compacted_ssts_deleted.load(Ordering::Relaxed));
+println!("Manifests deleted: {}", 
+    stats.manifests_deleted.load(Ordering::Relaxed));
+```
+
+## Scheduled GC with Cron
+
+Instead of a continuous background task, run GC periodically:
+
+```rust
+use tokio_cron_scheduler::{JobScheduler, Job};
+
+let scheduler = JobScheduler::new().await?;
+
+// Run GC every hour
+scheduler.add(Job::new_async("0 0 * * * *", move |_uuid, _lock| {
+    Box::pin(async move {
+        let gc = GarbageCollectorBuilder::new(path, object_store)
+            .build()
+            .await?;
+        gc.run_gc_once().await?;
+        Ok(())
+    })
+})?).await?;
+
+scheduler.start().await?;
+```
+
+## Checkpoint Preservation
+
+The GC automatically preserves files needed by checkpoints:
+
+```rust
+// Create checkpoint
+let checkpoint = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default()
+).await?;
+
+// GC will NOT delete SSTs referenced by this checkpoint
+gc.run_gc_once().await?;
+
+// Delete checkpoint to allow GC
+admin.delete_checkpoint(checkpoint.id).await?;
+
+// Now GC can delete those SSTs
+gc.run_gc_once().await?;
+```
+
+## Best Practices
+
+<Tip>
+  Run the garbage collector continuously in production to prevent unbounded storage growth.
+</Tip>
+
+<Tip>
+  Tune `min_age` based on your deployment's propagation delay. Longer delays provide more safety margin.
+</Tip>
+
+<Warning>
+  Setting `min_age` too low may delete files still in use by readers or compactors, causing errors.
+</Warning>
+
+<Note>
+  The GC is safe to run alongside the database and compactor. It will not delete files currently in use.
+</Note>
+
+## Troubleshooting
+
+### Storage Growth
+
+- Verify GC is running: check logs and statistics
+- Ensure `min_age` isn't too long
+- Check for stale checkpoints preventing cleanup
+
+### Files Deleted Prematurely
+
+- Increase `min_age` for all resource types
+- Check for clock skew between systems
+- Verify checkpoints are being tracked correctly
+
+### High Object Storage Costs
+
+- Delete old checkpoints that are no longer needed
+- Run GC more frequently (reduce `interval`)
+- Verify compaction is running to reduce total SSTs
+
+## See Also
+
+- [Configuration Guide](/guides/configuration) - GC configuration options
+- [Checkpoints](/api/checkpoint) - How checkpoints affect GC
+- [Compactor](/api/compactor) - Compaction creates obsolete SSTs

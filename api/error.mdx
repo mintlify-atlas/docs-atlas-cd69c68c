@@ -1,0 +1,358 @@
+---
+title: "Error Handling"
+description: "Error types and handling in SlateDB"
+---
+
+SlateDB uses a structured error system with public error types designed to help applications make informed decisions about error handling.
+
+## Error Type
+
+### `Error`
+
+```rust
+pub struct Error {
+    msg: String,
+    kind: ErrorKind,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+```
+
+The main error type returned by all public SlateDB APIs.
+
+### `kind`
+
+```rust
+pub fn kind(&self) -> ErrorKind
+```
+
+Returns the error kind, which indicates how the application should respond.
+
+<ResponseField name="ErrorKind" type="ErrorKind">
+  The category of error that occurred
+</ResponseField>
+
+## ErrorKind
+
+The `ErrorKind` enum categorizes errors by how applications should respond to them:
+
+### `ErrorKind::Transaction`
+
+```rust
+Transaction
+```
+
+A transaction conflict occurred. The transaction must be retried or dropped.
+
+**Example**
+
+```rust
+use slatedb::{ErrorKind, IsolationLevel};
+
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+txn.put(b"key", b"value");
+
+match txn.commit().await {
+    Ok(_) => println!("Transaction committed"),
+    Err(e) if matches!(e.kind(), ErrorKind::Transaction) => {
+        println!("Conflict detected, retrying...");
+        // Retry the transaction
+    }
+    Err(e) => return Err(e),
+}
+```
+
+### `ErrorKind::Closed`
+
+```rust
+Closed(CloseReason)
+```
+
+The database has been shutdown and is no longer usable. A new instance must be created.
+
+**CloseReason variants:**
+
+- `CloseReason::Clean` - Database was closed normally via `close()`
+- `CloseReason::Fenced` - Instance was fenced by a newer writer
+- `CloseReason::Panic` - One or more background tasks panicked
+
+**Example**
+
+```rust
+use slatedb::{ErrorKind, CloseReason};
+
+match db.get(b"key").await {
+    Ok(value) => println!("Value: {:?}", value),
+    Err(e) => match e.kind() {
+        ErrorKind::Closed(CloseReason::Clean) => {
+            println!("Database was closed cleanly");
+        }
+        ErrorKind::Closed(CloseReason::Fenced) => {
+            println!("Database was fenced by another writer");
+            // Reopen database or fail gracefully
+        }
+        ErrorKind::Closed(CloseReason::Panic) => {
+            println!("Database encountered a panic");
+            // Investigate logs, may need recovery
+        }
+        _ => return Err(e),
+    },
+}
+```
+
+### `ErrorKind::Unavailable`
+
+```rust
+Unavailable
+```
+
+A storage or network service is unavailable. The operation should be retried or dropped.
+
+**Example**
+
+```rust
+use slatedb::ErrorKind;
+
+let mut retries = 0;
+loop {
+    match db.put(b"key", b"value").await {
+        Ok(_) => break,
+        Err(e) if matches!(e.kind(), ErrorKind::Unavailable) && retries < 3 => {
+            retries += 1;
+            println!("Service unavailable, retrying... ({}/3)", retries);
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
+
+### `ErrorKind::Invalid`
+
+```rust
+Invalid
+```
+
+The user attempted an invalid request. This could be:
+
+- Invalid configuration on initialization
+- Invalid argument to a method
+- Invalid method call
+- User-supplied plugin (e.g., compaction scheduler, merge operator) failed
+
+The user must correct the code, configuration, or argument and retry.
+
+**Examples of invalid operations:**
+
+```rust
+use slatedb::WriteBatch;
+
+// Empty batch is invalid
+let batch = WriteBatch::new();
+let result = db.write(batch).await;
+assert!(matches!(result.unwrap_err().kind(), ErrorKind::Invalid));
+
+// Seeking outside iterator range
+let mut iter = db.scan(b"a"..b"z").await?;
+let result = iter.seek(b"0").await; // Outside range
+assert!(matches!(result.unwrap_err().kind(), ErrorKind::Invalid));
+
+// WAL operations when WAL is disabled
+use slatedb::config::{FlushOptions, FlushType};
+let result = db.flush_with_options(FlushOptions {
+    flush_type: FlushType::Wal,
+}).await;
+// If WAL is disabled, this returns Invalid
+```
+
+### `ErrorKind::Data`
+
+```rust
+Data
+```
+
+Persisted data is in an unexpected state. This could be caused by:
+
+- Temporary or permanent storage corruption
+- Incompatible file format versions between clients
+- Eventual consistency issues in object storage
+
+The user must fix the data, use compatible clients, retry, or drop the operation.
+
+**Example**
+
+```rust
+use slatedb::ErrorKind;
+
+match db.get(b"key").await {
+    Ok(value) => println!("Value: {:?}", value),
+    Err(e) if matches!(e.kind(), ErrorKind::Data) => {
+        println!("Data corruption or version mismatch detected");
+        // Check client version, verify data integrity, restore from backup
+    }
+    Err(e) => return Err(e),
+}
+```
+
+### `ErrorKind::Internal`
+
+```rust
+Internal
+```
+
+An unexpected internal error occurred. Users should not expect to see this error. If you receive this error, please [open a GitHub issue](https://github.com/slatedb/slatedb/issues/new?template=bug_report.md&title=Internal+error+returned).
+
+## CloseReason
+
+### `CloseReason`
+
+```rust
+pub enum CloseReason {
+    Clean,
+    Fenced,
+    Panic,
+}
+```
+
+Represents why a database instance was closed.
+
+#### `Clean`
+
+The database was shutdown cleanly via `close()`.
+
+#### `Fenced`
+
+The current instance has been fenced and is no longer usable. This happens when a newer writer detects an older writer and forces it to close.
+
+#### `Panic`
+
+One or more background tasks panicked, causing the database to shut down.
+
+## Error Handling Patterns
+
+### Checking Error Kind
+
+```rust
+use slatedb::{ErrorKind, CloseReason};
+
+match db.get(b"key").await {
+    Ok(value) => { /* ... */ }
+    Err(e) => match e.kind() {
+        ErrorKind::Transaction => { /* Retry transaction */ }
+        ErrorKind::Closed(_) => { /* Reopen or exit */ }
+        ErrorKind::Unavailable => { /* Retry operation */ }
+        ErrorKind::Invalid => { /* Fix request */ }
+        ErrorKind::Data => { /* Check data/version */ }
+        ErrorKind::Internal => { /* Report bug */ }
+    },
+}
+```
+
+### Retry Logic
+
+```rust
+use slatedb::ErrorKind;
+use tokio::time::{Duration, sleep};
+
+async fn write_with_retry(
+    db: &slatedb::Db,
+    key: &[u8],
+    value: &[u8],
+    max_retries: u32,
+) -> Result<(), slatedb::Error> {
+    let mut retries = 0;
+    loop {
+        match db.put(key, value).await {
+            Ok(_) => return Ok(()),
+            Err(e) if matches!(e.kind(), ErrorKind::Unavailable) && retries < max_retries => {
+                retries += 1;
+                sleep(Duration::from_millis(100 * retries as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+### Transaction Retry
+
+```rust
+use slatedb::{ErrorKind, IsolationLevel};
+
+async fn increment_counter(
+    db: &slatedb::Db,
+    key: &[u8],
+) -> Result<(), slatedb::Error> {
+    loop {
+        let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+        
+        let current = txn.get(key).await?
+            .map(|bytes| u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            .unwrap_or(0);
+        
+        txn.put(key, &(current + 1).to_le_bytes());
+        
+        match txn.commit().await {
+            Ok(_) => return Ok(()),
+            Err(e) if matches!(e.kind(), ErrorKind::Transaction) => {
+                // Conflict detected, retry
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+### Graceful Shutdown
+
+```rust
+use slatedb::{ErrorKind, CloseReason};
+
+match db.status() {
+    Ok(_) => println!("Database is healthy"),
+    Err(e) => match e.kind() {
+        ErrorKind::Closed(CloseReason::Clean) => {
+            println!("Database already closed");
+        }
+        ErrorKind::Closed(CloseReason::Fenced) => {
+            println!("Database was fenced, creating new instance");
+            // Reopen database
+        }
+        ErrorKind::Closed(CloseReason::Panic) => {
+            println!("Database panicked, check logs");
+            // Investigate and recover
+        }
+        _ => return Err(e),
+    },
+}
+```
+
+## Display and Debug
+
+Errors implement both `Display` and `Debug` for logging:
+
+```rust
+match db.get(b"key").await {
+    Ok(value) => { /* ... */ }
+    Err(e) => {
+        eprintln!("Error: {}", e);        // Display
+        eprintln!("Error: {:?}", e);      // Debug
+        eprintln!("Kind: {:?}", e.kind()); // ErrorKind
+    }
+}
+```
+
+## Source Errors
+
+You can access the underlying error source:
+
+```rust
+use std::error::Error;
+
+if let Err(e) = db.get(b"key").await {
+    println!("Error: {}", e);
+    if let Some(source) = e.source() {
+        println!("Caused by: {}", source);
+    }
+}
+```

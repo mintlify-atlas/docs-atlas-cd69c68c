@@ -1,0 +1,536 @@
+---
+title: Database Statistics
+description: Monitor database operations and performance metrics in SlateDB
+---
+
+SlateDB provides comprehensive statistics to monitor database operations, memory usage, and performance. All database statistics are prefixed with `db/`.
+
+## Accessing Database Statistics
+
+Database statistics are available through the metrics registry:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Get the metrics registry
+    let metrics = db.metrics();
+    
+    // Access specific database statistics
+    if let Some(get_requests) = metrics.lookup("db/get_requests") {
+        println!("Total GET requests: {}", get_requests.get());
+    }
+    
+    Ok(())
+}
+```
+
+## Request Statistics
+
+Track the volume of different request types:
+
+### db/get_requests
+
+**Type:** Counter  
+**Description:** Total number of GET requests issued to the database
+
+```rust
+let gets = metrics.lookup("db/get_requests")?.get();
+println!("Total GET requests: {}", gets);
+```
+
+### db/scan_requests
+
+**Type:** Counter  
+**Description:** Total number of scan/range query requests issued to the database
+
+```rust
+let scans = metrics.lookup("db/scan_requests")?.get();
+println!("Total scan requests: {}", scans);
+```
+
+### db/flush_requests
+
+**Type:** Counter  
+**Description:** Total number of explicit flush requests (via `Db::flush()`)
+
+This does not include automatic flushes triggered by `flush_interval`.
+
+```rust
+let flushes = metrics.lookup("db/flush_requests")?.get();
+```
+
+## Write Statistics
+
+Monitor write operations and batching:
+
+### db/write_batch_count
+
+**Type:** Counter  
+**Description:** Total number of write batches submitted to the database
+
+Each write batch may contain multiple write operations.
+
+```rust
+let batches = metrics.lookup("db/write_batch_count")?.get();
+```
+
+### db/write_ops
+
+**Type:** Counter  
+**Description:** Total number of individual write operations (puts, deletes, merges) across all batches
+
+```rust
+let writes = metrics.lookup("db/write_ops")?.get();
+let batches = metrics.lookup("db/write_batch_count")?.get();
+let avg_batch_size = writes as f64 / batches as f64;
+println!("Average batch size: {:.2} operations", avg_batch_size);
+```
+
+## Flush Statistics
+
+Track flush operations and their impact:
+
+### db/immutable_memtable_flushes
+
+**Type:** Counter  
+**Description:** Number of times immutable memtables have been flushed to L0 object storage
+
+This counter increments when memtables reach `l0_sst_size_bytes` and are written to L0 as SSTables.
+
+```rust
+let memtable_flushes = metrics.lookup("db/immutable_memtable_flushes")?.get();
+```
+
+**High flush rates may indicate:**
+- Small `l0_sst_size_bytes` configuration
+- High write throughput
+- Need for increased memtable size
+
+### db/wal_buffer_flushes
+
+**Type:** Counter  
+**Description:** Number of times the WAL buffer has been flushed to object storage
+
+This counter increments based on `flush_interval` or when the WAL buffer is explicitly flushed.
+
+```rust
+let wal_flushes = metrics.lookup("db/wal_buffer_flushes")?.get();
+```
+
+## Memory Statistics
+
+Monitor in-memory data structures:
+
+### db/total_mem_size_bytes
+
+**Type:** Gauge (i64)  
+**Description:** Current total size of in-memory data (memtables and WAL buffers) in bytes
+
+This gauge reflects the current memory pressure from unflushed writes.
+
+```rust
+let mem_bytes = metrics.lookup("db/total_mem_size_bytes")?.get();
+let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
+println!("In-memory data: {:.2} MB", mem_mb);
+```
+
+**Compare to `max_unflushed_bytes`** in your configuration to understand memory utilization:
+
+```rust
+let max_unflushed = 1024 * 1024 * 1024; // 1 GB from config
+let utilization = mem_bytes as f64 / max_unflushed as f64;
+
+if utilization > 0.9 {
+    println!("Warning: High memory utilization: {:.1}%", utilization * 100.0);
+}
+```
+
+### db/wal_buffer_estimated_bytes
+
+**Type:** Gauge (i64)  
+**Description:** Current estimated size of data in the WAL buffer in bytes
+
+This tracks data that has been written but not yet flushed to object storage.
+
+```rust
+let wal_bytes = metrics.lookup("db/wal_buffer_estimated_bytes")?.get();
+let wal_mb = wal_bytes as f64 / (1024.0 * 1024.0);
+println!("WAL buffer size: {:.2} MB", wal_mb);
+```
+
+## SSTable Statistics
+
+### db/l0_sst_count
+
+**Type:** Gauge (i64)  
+**Description:** Current number of SSTables in L0 (Level 0)
+
+L0 SSTables are the most recently flushed memtables. High L0 SST counts can impact read performance.
+
+```rust
+let l0_count = metrics.lookup("db/l0_sst_count")?.get();
+println!("L0 SST count: {}", l0_count);
+```
+
+**Compare to `l0_max_ssts`** in your configuration:
+
+```rust
+let max_l0_ssts = 8; // from config
+if l0_count >= max_l0_ssts {
+    println!("Warning: L0 is full. Writes may be blocked until compaction completes.");
+}
+```
+
+**High L0 counts may indicate:**
+- Insufficient compaction throughput
+- High write rate
+- Need for more concurrent compactions
+
+## Bloom Filter Statistics
+
+Monitor bloom filter effectiveness:
+
+### db/sst_filter_positives
+
+**Type:** Counter  
+**Description:** Number of times a bloom filter indicated a key might be present (true positive or false positive)
+
+When a bloom filter returns positive, the SSTable must be checked for the key.
+
+```rust
+let filter_positives = metrics.lookup("db/sst_filter_positives")?.get();
+```
+
+### db/sst_filter_negatives
+
+**Type:** Counter  
+**Description:** Number of times a bloom filter indicated a key is definitely not present (true negative)
+
+Bloom filter negatives avoid unnecessary SSTable reads, improving performance.
+
+```rust
+let filter_negatives = metrics.lookup("db/sst_filter_negatives")?.get();
+```
+
+### db/sst_filter_false_positives
+
+**Type:** Counter  
+**Description:** Number of times a bloom filter indicated a key might be present, but it was not found in the SSTable
+
+False positives waste I/O by triggering unnecessary SSTable reads.
+
+```rust
+let false_positives = metrics.lookup("db/sst_filter_false_positives")?.get();
+let positives = metrics.lookup("db/sst_filter_positives")?.get();
+let fpp = false_positives as f64 / positives as f64;
+println!("False positive rate: {:.2}%", fpp * 100.0);
+```
+
+**Expected false positive rate:** With `filter_bits_per_key = 10`, expect ~0.82% FPP per sorted run.
+
+**High false positive rates may indicate:**
+- Insufficient `filter_bits_per_key`
+- Many sorted runs (multiply FPP by number of runs)
+- Need for compaction to reduce sorted runs
+
+## Backpressure Statistics
+
+### db/backpressure_count
+
+**Type:** Counter  
+**Description:** Number of times writes were paused due to backpressure
+
+Backpressure occurs when:
+- Unflushed bytes exceed `max_unflushed_bytes`
+- L0 SST count exceeds `l0_max_ssts`
+
+```rust
+let backpressure = metrics.lookup("db/backpressure_count")?.get();
+
+if backpressure > 0 {
+    println!("Warning: Backpressure applied {} times", backpressure);
+}
+```
+
+**Frequent backpressure may indicate:**
+- Insufficient flush throughput
+- Too small `max_unflushed_bytes`
+- Too small `l0_max_ssts`
+- Compaction falling behind
+
+## Monitoring Best Practices
+
+### 1. Monitor Request Rate
+
+Track requests per second to understand load:
+
+```rust
+use std::time::{Duration, Instant};
+
+let start = Instant::now();
+let initial_gets = metrics.lookup("db/get_requests")?.get();
+let initial_writes = metrics.lookup("db/write_ops")?.get();
+
+std::thread::sleep(Duration::from_secs(60));
+
+let elapsed = start.elapsed().as_secs_f64();
+let final_gets = metrics.lookup("db/get_requests")?.get();
+let final_writes = metrics.lookup("db/write_ops")?.get();
+
+let gets_per_sec = (final_gets - initial_gets) as f64 / elapsed;
+let writes_per_sec = (final_writes - initial_writes) as f64 / elapsed;
+
+println!("GET rate: {:.1} req/s", gets_per_sec);
+println!("Write rate: {:.1} ops/s", writes_per_sec);
+```
+
+### 2. Calculate Write Amplification
+
+Track how efficiently writes are batched:
+
+```rust
+let write_ops = metrics.lookup("db/write_ops")?.get();
+let write_batches = metrics.lookup("db/write_batch_count")?.get();
+let avg_batch_size = write_ops as f64 / write_batches as f64;
+
+println!("Average write batch size: {:.2}", avg_batch_size);
+
+if avg_batch_size < 10.0 {
+    println!("Consider batching more writes for efficiency");
+}
+```
+
+### 3. Monitor Memory Pressure
+
+Set up alerts for high memory utilization:
+
+```rust
+fn check_memory_pressure(metrics: &StatRegistry, max_unflushed_bytes: i64) {
+    let mem_bytes = metrics.lookup("db/total_mem_size_bytes")
+        .map(|s| s.get())
+        .unwrap_or(0);
+    
+    let utilization = mem_bytes as f64 / max_unflushed_bytes as f64;
+    
+    if utilization > 0.9 {
+        eprintln!("CRITICAL: Memory utilization at {:.1}%", utilization * 100.0);
+    } else if utilization > 0.7 {
+        println!("WARNING: Memory utilization at {:.1}%", utilization * 100.0);
+    }
+}
+```
+
+### 4. Track L0 SST Growth
+
+Monitor L0 growth to ensure compaction keeps up:
+
+```rust
+fn check_l0_growth(metrics: &StatRegistry, max_l0_ssts: i64) {
+    let l0_count = metrics.lookup("db/l0_sst_count")
+        .map(|s| s.get())
+        .unwrap_or(0);
+    
+    let utilization = l0_count as f64 / max_l0_ssts as f64;
+    
+    if utilization >= 1.0 {
+        eprintln!("CRITICAL: L0 is full ({}/{}). Writes blocked.", l0_count, max_l0_ssts);
+    } else if utilization > 0.8 {
+        println!("WARNING: L0 at {:.1}% capacity ({}/{})", 
+            utilization * 100.0, l0_count, max_l0_ssts);
+    }
+}
+```
+
+### 5. Monitor Bloom Filter Effectiveness
+
+Ensure bloom filters are providing value:
+
+```rust
+fn analyze_bloom_filters(metrics: &StatRegistry) {
+    let positives = metrics.lookup("db/sst_filter_positives")
+        .map(|s| s.get())
+        .unwrap_or(0);
+    let negatives = metrics.lookup("db/sst_filter_negatives")
+        .map(|s| s.get())
+        .unwrap_or(0);
+    let false_positives = metrics.lookup("db/sst_filter_false_positives")
+        .map(|s| s.get())
+        .unwrap_or(0);
+    
+    let total_checks = positives + negatives;
+    if total_checks == 0 {
+        return;
+    }
+    
+    let negative_rate = negatives as f64 / total_checks as f64;
+    let fpp = if positives > 0 {
+        false_positives as f64 / positives as f64
+    } else {
+        0.0
+    };
+    
+    println!("Bloom filter negative rate: {:.1}%", negative_rate * 100.0);
+    println!("False positive rate: {:.2}%", fpp * 100.0);
+    
+    if negative_rate < 0.5 {
+        println!("INFO: Most lookups result in SST reads. Consider workload analysis.");
+    }
+    
+    if fpp > 0.02 {
+        println!("WARNING: High false positive rate. Consider increasing filter_bits_per_key.");
+    }
+}
+```
+
+## Example: Complete Monitoring Dashboard
+
+```rust
+use slatedb::{Db, Error};
+use std::time::Duration;
+use tokio::time::interval;
+
+struct DbMonitor {
+    db: Db,
+    max_unflushed_bytes: i64,
+    max_l0_ssts: i64,
+}
+
+impl DbMonitor {
+    fn new(db: Db, max_unflushed_bytes: i64, max_l0_ssts: i64) -> Self {
+        Self {
+            db,
+            max_unflushed_bytes,
+            max_l0_ssts,
+        }
+    }
+    
+    async fn monitor(&self) {
+        let mut ticker = interval(Duration::from_secs(60));
+        
+        loop {
+            ticker.tick().await;
+            self.report_metrics();
+        }
+    }
+    
+    fn report_metrics(&self) {
+        let metrics = self.db.metrics();
+        
+        println!("\n=== SlateDB Statistics ===");
+        
+        // Request statistics
+        let gets = metrics.lookup("db/get_requests").map(|s| s.get()).unwrap_or(0);
+        let scans = metrics.lookup("db/scan_requests").map(|s| s.get()).unwrap_or(0);
+        let writes = metrics.lookup("db/write_ops").map(|s| s.get()).unwrap_or(0);
+        let batches = metrics.lookup("db/write_batch_count").map(|s| s.get()).unwrap_or(0);
+        
+        println!("Requests: {} gets, {} scans, {} writes ({} batches)",
+            gets, scans, writes, batches);
+        
+        if batches > 0 {
+            println!("Average batch size: {:.2}", writes as f64 / batches as f64);
+        }
+        
+        // Memory statistics
+        let mem_bytes = metrics.lookup("db/total_mem_size_bytes").map(|s| s.get()).unwrap_or(0);
+        let wal_bytes = metrics.lookup("db/wal_buffer_estimated_bytes").map(|s| s.get()).unwrap_or(0);
+        let mem_util = mem_bytes as f64 / self.max_unflushed_bytes as f64;
+        
+        println!("Memory: {:.2} MB total, {:.2} MB WAL ({:.1}% utilized)",
+            mem_bytes as f64 / (1024.0 * 1024.0),
+            wal_bytes as f64 / (1024.0 * 1024.0),
+            mem_util * 100.0);
+        
+        // L0 statistics
+        let l0_count = metrics.lookup("db/l0_sst_count").map(|s| s.get()).unwrap_or(0);
+        let l0_util = l0_count as f64 / self.max_l0_ssts as f64;
+        
+        println!("L0 SSTs: {}/{} ({:.1}%)", l0_count, self.max_l0_ssts, l0_util * 100.0);
+        
+        // Flush statistics
+        let memtable_flushes = metrics.lookup("db/immutable_memtable_flushes").map(|s| s.get()).unwrap_or(0);
+        let wal_flushes = metrics.lookup("db/wal_buffer_flushes").map(|s| s.get()).unwrap_or(0);
+        
+        println!("Flushes: {} memtable, {} WAL", memtable_flushes, wal_flushes);
+        
+        // Bloom filter statistics
+        let positives = metrics.lookup("db/sst_filter_positives").map(|s| s.get()).unwrap_or(0);
+        let negatives = metrics.lookup("db/sst_filter_negatives").map(|s| s.get()).unwrap_or(0);
+        let false_positives = metrics.lookup("db/sst_filter_false_positives").map(|s| s.get()).unwrap_or(0);
+        
+        if positives + negatives > 0 {
+            let fpp = if positives > 0 {
+                false_positives as f64 / positives as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!("Bloom filters: {} positive, {} negative, {:.2}% FPP",
+                positives, negatives, fpp);
+        }
+        
+        // Backpressure
+        let backpressure = metrics.lookup("db/backpressure_count").map(|s| s.get()).unwrap_or(0);
+        if backpressure > 0 {
+            println!("⚠️  Backpressure applied {} times", backpressure);
+        }
+        
+        // Warnings
+        if mem_util > 0.9 {
+            println!("⚠️  WARNING: High memory utilization");
+        }
+        if l0_util > 0.9 {
+            println!("⚠️  WARNING: L0 nearly full");
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = Db::open("my_db", object_store).await?;
+    let monitor = DbMonitor::new(
+        db,
+        1024 * 1024 * 1024,  // 1 GB max_unflushed_bytes
+        8,                    // max_l0_ssts
+    );
+    monitor.monitor().await;
+    Ok(())
+}
+```
+
+## Troubleshooting Common Issues
+
+### Write Latency Issues
+
+If writes are slow:
+
+1. Check `db/backpressure_count` - if non-zero, increase `max_unflushed_bytes` or `l0_max_ssts`
+2. Check `db/l0_sst_count` - if at max, increase compaction throughput
+3. Check `flush_interval` - higher values reduce PUT costs but increase latency
+
+### Read Latency Issues
+
+If reads are slow:
+
+1. Check bloom filter statistics - high false positive rates waste I/O
+2. Check `db/l0_sst_count` - many L0 SSTs slow reads; run compaction
+3. Review cache statistics for low hit rates
+
+### Memory Issues
+
+If memory usage is too high:
+
+1. Check `db/total_mem_size_bytes` vs `max_unflushed_bytes`
+2. Check `db/wal_buffer_estimated_bytes` - may need more frequent flushes
+3. Reduce `l0_sst_size_bytes` to flush memtables more frequently
+
+## See Also
+
+- [Settings](/api/settings) - Configure database behavior
+- [Cache Statistics](/api/cache-stats) - Monitor cache performance

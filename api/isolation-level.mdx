@@ -1,0 +1,218 @@
+---
+title: "IsolationLevel"
+description: "Transaction isolation level configuration"
+---
+
+## Overview
+
+`IsolationLevel` determines what kinds of conflicts are detected when transactions commit. SlateDB supports two isolation levels:
+
+- **Snapshot Isolation** (default): Detects write-write conflicts only
+- **Serializable Snapshot Isolation**: Detects both read-write and write-write conflicts
+
+## Variants
+
+### Snapshot
+
+Snapshot Isolation (SI) is the default isolation level. It detects write-write conflicts but allows read-write anomalies (phantom reads).
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+```
+
+**Characteristics:**
+
+- ✅ Fast performance with minimal overhead
+- ✅ Detects concurrent writes to the same key
+- ❌ Does not prevent phantom reads
+- ❌ Read-write conflicts are not detected
+
+**When to use:**
+
+- Most general-purpose workloads
+- High-throughput applications
+- When phantom reads are acceptable
+- When transactions rarely conflict
+
+**Example conflict:**
+
+```rust
+// Transaction 1
+let txn1 = db.begin(IsolationLevel::Snapshot).await?;
+txn1.put(b"account:1", b"100")?;
+
+// Transaction 2 (overlapping with txn1)
+let txn2 = db.begin(IsolationLevel::Snapshot).await?;
+txn2.put(b"account:1", b"200")?;
+
+// First commit succeeds
+txn1.commit().await?;
+
+// Second commit fails with TransactionConflict
+txn2.commit().await?; // Error!
+```
+
+### SerializableSnapshot
+
+Serializable Snapshot Isolation (SSI) provides true serializability by detecting both read-write and write-write conflicts.
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+```
+
+**Characteristics:**
+
+- ✅ Prevents all anomalies including phantom reads
+- ✅ True serializability guarantees
+- ✅ Detects read-write conflicts via range tracking
+- ❌ Higher overhead due to conflict tracking
+- ❌ More transaction aborts
+
+**When to use:**
+
+- Financial applications requiring strict consistency
+- When phantom reads would cause correctness issues
+- Applications that need full ACID guarantees
+- Lower throughput workloads where correctness is paramount
+
+**Example read-write conflict:**
+
+```rust
+// Transaction 1 reads a range
+let txn1 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let mut iter = txn1.scan(b"item:"..b"item:~").await?;
+let mut count = 0;
+while let Some(_) = iter.next().await? {
+    count += 1;
+}
+println!("Count: {}", count);
+
+// Transaction 2 inserts in that range
+let txn2 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+txn2.put(b"item:new", b"data")?;
+txn2.commit().await?; // Succeeds
+
+// txn1 commit fails - the count it computed is now stale
+txn1.commit().await?; // Error: TransactionConflict
+```
+
+## Conflict Detection
+
+### Write-Write Conflicts
+
+Both isolation levels detect write-write conflicts:
+
+```rust
+// Both transactions write the same key
+txn1.put(b"key", b"value1")?;
+txn2.put(b"key", b"value2")?;
+
+// One commit will succeed, the other fails
+txn1.commit().await?;
+txn2.commit().await?; // TransactionConflict
+```
+
+### Read-Write Conflicts
+
+Only SerializableSnapshot detects read-write conflicts:
+
+```rust
+// txn1 reads a key
+let value = txn1.get(b"key").await?;
+
+// txn2 modifies that key
+txn2.put(b"key", b"new_value")?;
+txn2.commit().await?;
+
+// With Snapshot: txn1 commit succeeds (read-write not detected)
+// With SerializableSnapshot: txn1 commit fails (read-write detected)
+txn1.commit().await?;
+```
+
+### Range Conflicts
+
+SerializableSnapshot also tracks range reads:
+
+```rust
+// txn1 scans a range
+let mut iter = txn1.scan(b"prefix:"..b"prefix:~").await?;
+while let Some(_) = iter.next().await? {}
+
+// txn2 writes within that range
+txn2.put(b"prefix:new_key", b"value")?;
+txn2.commit().await?;
+
+// With SerializableSnapshot: txn1 commit fails (phantom read prevented)
+txn1.commit().await?; // TransactionConflict
+```
+
+## Performance Considerations
+
+<CardGroup cols={2}>
+  <Card title="Snapshot Isolation" icon="gauge-high">
+    - Lower memory overhead
+    - Fewer aborted transactions
+    - Better throughput
+    - Suitable for most workloads
+  </Card>
+  <Card title="Serializable Snapshot" icon="shield-check">
+    - Tracks read keys and ranges
+    - More transaction conflicts
+    - Lower throughput
+    - Stronger correctness guarantees
+  </Card>
+</CardGroup>
+
+## Choosing an Isolation Level
+
+### Use Snapshot Isolation when:
+
+- You need high throughput
+- Conflicts are rare in your workload
+- Application logic can handle occasional phantom reads
+- You're building a cache or session store
+
+### Use Serializable Snapshot when:
+
+- Correctness is more important than performance
+- You need to prevent phantom reads
+- Building financial or inventory systems
+- Concurrent aggregations or analytics queries
+
+## Example: Choosing the Right Level
+
+```rust
+use slatedb::{Db, IsolationLevel};
+
+// High-throughput session store - use Snapshot
+let session_txn = db.begin(IsolationLevel::Snapshot).await?;
+session_txn.put(user_key, session_data)?;
+session_txn.commit().await?;
+
+// Financial transfer - use SerializableSnapshot
+let transfer_txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let from_balance = transfer_txn.get(from_account).await?;
+let to_balance = transfer_txn.get(to_account).await?;
+// ... update balances ...
+transfer_txn.commit().await?;
+```
+
+## Implementation Details
+
+<Info>
+  SlateDB uses multi-version concurrency control (MVCC) to implement both isolation levels. Each transaction sees a consistent snapshot based on its start sequence number.
+</Info>
+
+<Note>
+  Conflict detection happens at commit time. The transaction manager compares the transaction's read/write sets against recently committed transactions to detect conflicts.
+</Note>
+
+## See Also
+
+- [DbTransaction](/api/db-transaction) - Transaction API reference
+- [Transactions Guide](/guides/transactions) - Comprehensive transaction usage guide
+- [Error](/api/error) - Error handling for transaction conflicts

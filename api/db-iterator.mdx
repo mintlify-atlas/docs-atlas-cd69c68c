@@ -1,0 +1,495 @@
+---
+title: 'DbIterator'
+description: 'Iterator for scanning key-value pairs in SlateDB'
+---
+
+## Overview
+
+The `DbIterator` is returned by scan operations and provides an iterator interface for traversing key-value pairs in SlateDB. It supports both range scans and point lookups, with advanced features like seeking and proper handling of tombstones, TTL expiration, and merge operations.
+
+## Structure
+
+```rust
+pub struct DbIterator {
+    range: BytesRange,
+    iter: Box<dyn RowEntryIterator + 'static>,
+    invalidated_error: Option<SlateDBError>,
+    last_key: Option<Bytes>,
+    range_tracker: Option<Arc<DbIteratorRangeTracker>>,
+}
+```
+
+<ParamField path="range" type="BytesRange">
+  The key range this iterator covers
+</ParamField>
+
+<ParamField path="iter" type="Box<dyn RowEntryIterator>">
+  Internal iterator over row entries
+</ParamField>
+
+<ParamField path="invalidated_error" type="Option<SlateDBError>">
+  If set, the iterator has encountered an error and is invalidated
+</ParamField>
+
+<ParamField path="last_key" type="Option<Bytes>">
+  The last key returned by the iterator (used for seek validation)
+</ParamField>
+
+<ParamField path="range_tracker" type="Option<Arc<DbIteratorRangeTracker>>">
+  Optional tracker for monitoring accessed key ranges (used internally for transaction conflict detection)
+</ParamField>
+
+## Methods
+
+### next
+
+```rust
+pub async fn next(&mut self) -> Result<Option<KeyValue>, Error>
+```
+
+Get the next key-value pair from the iterator.
+
+This method automatically filters out tombstones (deleted keys) and returns only valid key-value pairs. When the iterator reaches the end of the range, it returns `None`.
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  - `Ok(Some(KeyValue))` - The next key-value pair
+  - `Ok(None)` - No more entries in the range
+  - `Err(Error)` - If the iterator has been invalidated or an error occurred
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Insert some data
+    db.put(b"apple", b"red").await?;
+    db.put(b"banana", b"yellow").await?;
+    db.put(b"cherry", b"red").await?;
+    
+    // Scan all keys
+    let mut iter = db.scan(..).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", 
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    // Prints:
+    // Key: "apple", Value: "red"
+    // Key: "banana", Value: "yellow"
+    // Key: "cherry", Value: "red"
+    
+    Ok(())
+}
+```
+
+---
+
+### seek
+
+```rust
+pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), Error>
+```
+
+Seek ahead to the next key. The next key must be larger than the last key returned by the iterator and less than the end bound specified in the original scan.
+
+After a successful seek, the iterator will return the next record with a key greater than or equal to `next_key`.
+
+<ParamField path="next_key" type="K: AsRef<[u8]>" required>
+  The key to seek to
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  - `Ok(())` - Seek successful
+  - `Err(Error)` - If:
+    - `next_key` comes before the current iterator position
+    - `next_key` is beyond the upper bound of the scan range
+    - The iterator has been invalidated
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Insert data
+    db.put(b"a", b"1").await?;
+    db.put(b"b", b"2").await?;
+    db.put(b"c", b"3").await?;
+    db.put(b"d", b"4").await?;
+    db.put(b"e", b"5").await?;
+    
+    let mut iter = db.scan(..).await?;
+    
+    // Get first key
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"a");
+    
+    // Seek to "d"
+    iter.seek(b"d").await?;
+    
+    // Next returns "d"
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"d");
+    
+    // Continue iterating from "d"
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"e");
+    
+    Ok(())
+}
+```
+
+**Seek Constraints:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"a", b"1").await?;
+    db.put(b"b", b"2").await?;
+    db.put(b"c", b"3").await?;
+    
+    let mut iter = db.scan(..).await?;
+    
+    // Consume first key
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"a");
+    
+    // Cannot seek backwards
+    let err = iter.seek(b"a").await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid error: cannot seek to a key less than the last returned key"
+    );
+    
+    // Can seek forward
+    iter.seek(b"c").await?;
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"c");
+    
+    Ok(())
+}
+```
+
+## Creating Iterators
+
+Iterators are created by calling scan methods on types implementing the `DbRead` trait:
+
+### From Db
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Full scan
+    let mut iter = db.scan(..).await?;
+    
+    // Range scan
+    let mut iter = db.scan(b"a"..b"m").await?;
+    
+    // Prefix scan
+    let mut iter = db.scan_prefix(b"user:").await?;
+    
+    Ok(())
+}
+```
+
+### From DbReader
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    
+    // Create database and write data
+    let db = Db::open("my_db", Arc::clone(&object_store)).await?;
+    db.put(b"key1", b"value1").await?;
+    db.flush().await?;
+    
+    // Open reader
+    let reader = DbReader::open(
+        "my_db",
+        Arc::clone(&object_store),
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    // Scan from reader
+    let mut iter = reader.scan(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}", kv.key);
+    }
+    
+    Ok(())
+}
+```
+
+### From DbSnapshot
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    let snapshot = db.snapshot().await?;
+    
+    // Scan from snapshot
+    let mut iter = snapshot.scan(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}", kv.key);
+    }
+    
+    Ok(())
+}
+```
+
+## Range Types
+
+Iterators support various range types:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Full range
+    let mut iter = db.scan(..).await?;
+    
+    // From start to key (exclusive)
+    let mut iter = db.scan(..b"m".as_ref()).await?;
+    
+    // From start to key (inclusive)
+    let mut iter = db.scan(..=b"m".as_ref()).await?;
+    
+    // From key to end
+    let mut iter = db.scan(b"a".as_ref()..).await?;
+    
+    // Between two keys (exclusive end)
+    let mut iter = db.scan(b"a"..b"m").await?;
+    
+    // Between two keys (inclusive end)
+    let mut iter = db.scan(b"a"..=b"m").await?;
+    
+    Ok(())
+}
+```
+
+## Advanced Features
+
+### Filtering and TTL
+
+The iterator automatically handles:
+
+1. **Tombstone Filtering**: Deleted keys are not returned
+2. **TTL Expiration**: Expired keys are filtered out based on current time
+3. **Sequence Number Filtering**: For snapshots and transactions, only keys with appropriate sequence numbers are returned
+
+**Example with TTL:**
+
+```rust
+use slatedb::Db;
+use slatedb::config::PutOptions;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Insert with TTL
+    db.put_with_options(
+        b"temp_key",
+        b"temp_value",
+        &PutOptions::default().with_ttl(Duration::from_secs(60)),
+        &Default::default(),
+    ).await?;
+    
+    // Immediately visible
+    let mut iter = db.scan(..).await?;
+    assert!(iter.next().await?.is_some());
+    
+    // After TTL expires (in real code, you'd wait)
+    // The iterator would automatically filter out expired keys
+    
+    Ok(())
+}
+```
+
+### Merge Operations
+
+When a merge operator is configured, the iterator automatically applies merge operations:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // With a merge operator configured, the iterator
+    // automatically merges operands into final values
+    // (requires merge operator setup - see merge documentation)
+    
+    Ok(())
+}
+```
+
+## Error Handling
+
+Once an iterator encounters an error, it becomes **invalidated** and all subsequent operations will return the same error:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    let mut iter = db.scan(..).await?;
+    
+    // If an error occurs during iteration
+    if let Err(e) = iter.next().await {
+        // Iterator is now invalidated
+        // All subsequent calls will return the same error
+        assert!(iter.next().await.is_err());
+        assert!(iter.seek(b"key").await.is_err());
+    }
+    
+    Ok(())
+}
+```
+
+## Performance Considerations
+
+### Read-Ahead
+
+Configure read-ahead for better scan performance:
+
+```rust
+use slatedb::Db;
+use slatedb::config::ScanOptions;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    let options = ScanOptions::new()
+        .with_read_ahead_bytes(1024 * 1024)  // 1MB read-ahead
+        .with_max_fetch_tasks(4)              // 4 concurrent fetches
+        .with_cache_blocks(true);             // Cache fetched blocks
+    
+    let mut iter = db.scan_with_options(.., &options).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        // Process with improved throughput
+    }
+    
+    Ok(())
+}
+```
+
+### Seeking for Sparse Access
+
+Use seek for efficient sparse key access:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    let mut iter = db.scan(..).await?;
+    
+    // Process every 100th key efficiently
+    let keys_to_check = vec![b"key000", b"key100", b"key200"];
+    
+    for key in keys_to_check {
+        iter.seek(key).await?;
+        if let Some(kv) = iter.next().await? {
+            println!("Found: {:?}", kv.key);
+        }
+    }
+    
+    Ok(())
+}
+```
+
+## Usage Notes
+
+<Note>
+  Iterators automatically filter out tombstones and expired keys. You only receive valid, current key-value pairs.
+</Note>
+
+<Warning>
+  Seek operations can only move forward. Attempting to seek to a key before the current position will result in an error.
+</Warning>
+
+<Info>
+  For optimal performance on large scans, configure appropriate `read_ahead_bytes` and `max_fetch_tasks` in `ScanOptions`.
+</Info>
+
+## Related
+
+- [DbRead Trait](/api/db-read) - Methods that return iterators
+- [DbReader](/api/db-reader) - Read-only database access
+- [DbSnapshot](/api/db-snapshot) - Point-in-time snapshots
+- [Db](/api/db) - Main database interface

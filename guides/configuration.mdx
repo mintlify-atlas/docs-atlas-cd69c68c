@@ -1,0 +1,595 @@
+---
+title: 'Configuration'
+description: 'Configure and tune SlateDB for your workload'
+---
+
+SlateDB provides extensive configuration options to optimize performance, cost, and behavior for your specific workload. Configuration can be done through code, files (TOML, JSON, YAML), or environment variables.
+
+## Basic Configuration
+
+### Opening with Default Settings
+
+```rust
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = /* ... */;
+    
+    // Use default settings
+    let db = Db::open("/tmp/my_db", object_store).await?;
+    
+    Ok(())
+}
+```
+
+### Opening with Custom Settings
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::Settings;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = /* ... */;
+    
+    let settings = Settings {
+        flush_interval: Some(Duration::from_millis(100)),
+        l0_sst_size_bytes: 64 * 1024 * 1024,  // 64MB
+        manifest_poll_interval: Duration::from_secs(1),
+        ..Settings::default()
+    };
+    
+    let db = Db::builder("/tmp/my_db", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+    
+    Ok(())
+}
+```
+
+## Configuration Sources
+
+### From File
+
+Load settings from TOML, JSON, or YAML files:
+
+```rust
+use slatedb::config::Settings;
+
+// From TOML
+let settings = Settings::from_file("config.toml")?;
+
+// From JSON
+let settings = Settings::from_file("config.json")?;
+
+// From YAML
+let settings = Settings::from_file("config.yaml")?;
+```
+
+**Example TOML configuration:**
+
+```toml
+flush_interval = "100ms"
+manifest_poll_interval = "1s"
+manifest_update_timeout = "300s"
+min_filter_keys = 1000
+filter_bits_per_key = 10
+l0_sst_size_bytes = 67108864
+l0_max_ssts = 8
+max_unflushed_bytes = 536870912
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+max_concurrent_compactions = 4
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+```
+
+### From Environment Variables
+
+Override settings using environment variables:
+
+```rust
+use slatedb::config::Settings;
+
+// Load from environment variables with prefix "SLATEDB_"
+let settings = Settings::from_env("SLATEDB_")?;
+
+// Or merge with defaults
+let settings = Settings::from_env_with_default(
+    "SLATEDB_",
+    Settings::default()
+)?;
+```
+
+**Example environment variables:**
+
+```bash
+export SLATEDB_FLUSH_INTERVAL="100ms"
+export SLATEDB_L0_SST_SIZE_BYTES=67108864
+export SLATEDB_COMPACTOR_OPTIONS.POLL_INTERVAL="5s"
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER="/tmp/cache"
+```
+
+### Combined Configuration
+
+Load from multiple sources with precedence:
+
+```rust
+use slatedb::config::Settings;
+
+// Load from files + environment (env vars override files)
+let settings = Settings::load()?;
+
+// This checks:
+// 1. Default settings
+// 2. SlateDb.json
+// 3. SlateDb.toml
+// 4. SlateDb.yaml / SlateDb.yml
+// 5. Environment variables with "SLATEDB_" prefix
+```
+
+## Core Settings
+
+### Write-Ahead Log (WAL)
+
+#### flush_interval
+
+How often to flush WAL to object storage:
+
+```rust
+use std::time::Duration;
+
+let settings = Settings {
+    flush_interval: Some(Duration::from_millis(100)),  // Default: 100ms
+    ..Settings::default()
+};
+```
+
+<Note>
+- **Lower values**: Lower write latency, higher API costs
+- **Higher values**: Higher throughput, higher latency
+- **None**: Disable automatic flushing (manual flush only)
+</Note>
+
+**Cost example**: 100ms interval → ~$130/month in S3 PUT costs
+
+### Memtable and L0
+
+#### l0_sst_size_bytes
+
+Target size for L0 SSTables:
+
+```rust
+let settings = Settings {
+    l0_sst_size_bytes: 64 * 1024 * 1024,  // Default: 64MB
+    ..Settings::default()
+};
+```
+
+<Tip>
+- **Larger**: Fewer L0 SSTs, slower recovery, less compaction overhead
+- **Smaller**: Faster recovery, more L0 SSTs, more read/write amplification
+</Tip>
+
+#### l0_max_ssts
+
+Maximum number of L0 SSTables before applying backpressure:
+
+```rust
+let settings = Settings {
+    l0_max_ssts: 8,  // Default: 8
+    ..Settings::default()
+};
+```
+
+#### max_unflushed_bytes
+
+Maximum bytes in WAL + memtable before backpressure:
+
+```rust
+let settings = Settings {
+    max_unflushed_bytes: 1_073_741_824,  // Default: 1GB
+    ..Settings::default()
+};
+```
+
+### Manifest
+
+#### manifest_poll_interval
+
+How often to check for manifest updates:
+
+```rust
+use std::time::Duration;
+
+let settings = Settings {
+    manifest_poll_interval: Duration::from_secs(1),  // Default: 1s
+    ..Settings::default()
+};
+```
+
+#### manifest_update_timeout
+
+Maximum time to wait for manifest updates:
+
+```rust
+let settings = Settings {
+    manifest_update_timeout: Duration::from_secs(300),  // Default: 5 min
+    ..Settings::default()
+};
+```
+
+### Bloom Filters
+
+#### min_filter_keys
+
+Minimum keys in SSTable before adding bloom filter:
+
+```rust
+let settings = Settings {
+    min_filter_keys: 1000,  // Default: 1000
+    ..Settings::default()
+};
+```
+
+#### filter_bits_per_key
+
+Bits per key in bloom filters:
+
+```rust
+let settings = Settings {
+    filter_bits_per_key: 10,  // Default: 10 (~0.82% FPP)
+    ..Settings::default()
+};
+```
+
+<Note>
+10 bits per key → ~0.82% false positive probability per sorted run
+</Note>
+
+## Compaction Configuration
+
+### Basic Compactor Options
+
+```rust
+use slatedb::config::{CompactorOptions, Settings};
+use std::time::Duration;
+
+let compactor_options = CompactorOptions {
+    poll_interval: Duration::from_secs(5),       // Default: 5s
+    max_sst_size: 256 * 1024 * 1024,            // Default: 256MB
+    max_concurrent_compactions: 4,               // Default: 4
+    scheduler_options: Default::default(),
+    manifest_update_timeout: Duration::from_secs(300),
+};
+
+let settings = Settings {
+    compactor_options: Some(compactor_options),
+    ..Settings::default()
+};
+```
+
+### Size-Tiered Compaction
+
+Configure the size-tiered compaction scheduler:
+
+```rust
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert("min_compaction_sources".to_string(), "4".to_string());
+scheduler_options.insert("max_compaction_sources".to_string(), "8".to_string());
+scheduler_options.insert("include_size_threshold".to_string(), "4.0".to_string());
+
+let compactor_options = CompactorOptions {
+    scheduler_options,
+    ..Default::default()
+};
+```
+
+<Tip>
+- **min_compaction_sources**: Minimum sorted runs to compact together (default: 4)
+- **max_compaction_sources**: Maximum sorted runs to compact together (default: 8)
+- **include_size_threshold**: Size ratio threshold for including runs (default: 4.0)
+</Tip>
+
+## Cache Configuration
+
+### Object Store Cache
+
+Enable local disk caching of object store data:
+
+```rust
+use slatedb::config::{ObjectStoreCacheOptions, PreloadLevel};
+use std::time::Duration;
+
+let cache_options = ObjectStoreCacheOptions {
+    root_folder: Some("/tmp/slatedb-cache".into()),  // Enable cache
+    max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),  // 16GB
+    part_size_bytes: 4 * 1024 * 1024,  // 4MB parts
+    cache_puts: false,  // Cache writes
+    preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+    scan_interval: Some(Duration::from_secs(3600)),  // 1 hour
+};
+
+let settings = Settings {
+    object_store_cache_options: cache_options,
+    ..Settings::default()
+};
+```
+
+<Note>
+Set `root_folder` to `None` to disable the disk cache completely.
+</Note>
+
+### Cache Preloading
+
+Preload cache on startup:
+
+```rust
+use slatedb::config::PreloadLevel;
+
+let cache_options = ObjectStoreCacheOptions {
+    // Preload only L0 SSTs
+    preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+    
+    // Or preload all SSTs
+    // preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+    
+    ..Default::default()
+};
+```
+
+## Garbage Collection
+
+Configure garbage collection for different file types:
+
+```rust
+use slatedb::config::{
+    GarbageCollectorOptions,
+    GarbageCollectorDirectoryOptions,
+};
+use std::time::Duration;
+
+let gc_options = GarbageCollectorOptions {
+    // Manifest files
+    manifest_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),  // Run every 5 min
+        min_age: Duration::from_secs(86400),       // Delete after 1 day
+    }),
+    
+    // WAL files
+    wal_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(60)),   // Run every 1 min
+        min_age: Duration::from_secs(60),          // Delete after 1 min
+    }),
+    
+    // Compacted SSTs
+    compacted_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),
+        min_age: Duration::from_secs(86400),
+    }),
+    
+    // Compaction state files
+    compactions_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),
+        min_age: Duration::from_secs(86400),
+    }),
+};
+
+let settings = Settings {
+    garbage_collector_options: Some(gc_options),
+    ..Settings::default()
+};
+```
+
+<Warning>
+Set `interval` to `None` to disable automatic GC for a file type. You can still trigger GC manually.
+</Warning>
+
+## Compression
+
+Enable compression for SSTables:
+
+```rust
+use slatedb::config::{CompressionCodec, Settings};
+
+let settings = Settings {
+    compression_codec: Some(CompressionCodec::Zstd),  // or Snappy, Zlib, Lz4
+    ..Settings::default()
+};
+```
+
+<Tip>
+- **Zstd**: Best compression ratio
+- **Snappy**: Fast compression/decompression
+- **Lz4**: Very fast, good for hot data
+- **Zlib**: Standard compression
+</Tip>
+
+## TTL Configuration
+
+Set default time-to-live for keys:
+
+```rust
+use std::time::Duration;
+
+let settings = Settings {
+    default_ttl: Some(Duration::from_secs(3600).as_millis() as u64),  // 1 hour
+    ..Settings::default()
+};
+```
+
+## Merge Operator
+
+Configure a merge operator:
+
+```rust
+use slatedb::{MergeOperator, MergeOperatorError};
+use bytes::Bytes;
+use std::sync::Arc;
+
+struct CounterMerge;
+
+impl MergeOperator for CounterMerge {
+    fn merge(&self, _key: &Bytes, existing: Option<Bytes>, operand: Bytes)
+        -> Result<Bytes, MergeOperatorError>
+    {
+        // Implementation...
+        Ok(Bytes::new())
+    }
+}
+
+let db = Db::builder("/tmp/db", object_store)
+    .with_merge_operator(Arc::new(CounterMerge))
+    .build()
+    .await?;
+```
+
+## Performance Tuning
+
+### Write-Heavy Workloads
+
+```rust
+use std::time::Duration;
+
+let settings = Settings {
+    flush_interval: Some(Duration::from_millis(200)),  // Higher latency, lower cost
+    l0_sst_size_bytes: 128 * 1024 * 1024,             // Larger L0 SSTs
+    max_unflushed_bytes: 2 * 1024 * 1024 * 1024,      // More buffering
+    ..Settings::default()
+};
+```
+
+### Read-Heavy Workloads
+
+```rust
+let settings = Settings {
+    filter_bits_per_key: 12,  // Lower false positive rate
+    object_store_cache_options: ObjectStoreCacheOptions {
+        root_folder: Some("/tmp/cache".into()),
+        max_cache_size_bytes: Some(32 * 1024 * 1024 * 1024),  // Larger cache
+        ..Default::default()
+    },
+    compactor_options: Some(CompactorOptions {
+        max_concurrent_compactions: 8,  // More aggressive compaction
+        ..Default::default()
+    }),
+    ..Settings::default()
+};
+```
+
+### Low-Latency Workloads
+
+```rust
+let settings = Settings {
+    flush_interval: Some(Duration::from_millis(50)),  // Very low latency
+    l0_sst_size_bytes: 32 * 1024 * 1024,             // Smaller SSTs
+    ..Settings::default()
+};
+```
+
+## Complete Configuration Example
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::*;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    
+    let settings = Settings {
+        // WAL settings
+        flush_interval: Some(Duration::from_millis(100)),
+        
+        // Memtable and L0
+        l0_sst_size_bytes: 64 * 1024 * 1024,
+        l0_max_ssts: 8,
+        max_unflushed_bytes: 1_073_741_824,
+        
+        // Manifest
+        manifest_poll_interval: Duration::from_secs(1),
+        manifest_update_timeout: Duration::from_secs(300),
+        
+        // Bloom filters
+        min_filter_keys: 1000,
+        filter_bits_per_key: 10,
+        
+        // Compaction
+        compactor_options: Some(CompactorOptions {
+            poll_interval: Duration::from_secs(5),
+            max_sst_size: 256 * 1024 * 1024,
+            max_concurrent_compactions: 4,
+            manifest_update_timeout: Duration::from_secs(300),
+            scheduler_options: Default::default(),
+        }),
+        
+        // Compression
+        compression_codec: Some(CompressionCodec::Zstd),
+        
+        // Cache
+        object_store_cache_options: ObjectStoreCacheOptions {
+            root_folder: Some("/tmp/slatedb-cache".into()),
+            max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),
+            part_size_bytes: 4 * 1024 * 1024,
+            cache_puts: false,
+            preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+            scan_interval: Some(Duration::from_secs(3600)),
+        },
+        
+        // Garbage collection
+        garbage_collector_options: Some(GarbageCollectorOptions::default()),
+        
+        // TTL
+        default_ttl: None,
+        
+        // Merge operator
+        merge_operator: None,
+    };
+    
+    let db = Db::builder("/tmp/my_db", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+    
+    // Use database...
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Start using SlateDB
+  </Card>
+  <Card title="Compaction Strategies" icon="layer-group" href="/guides/compaction-strategies">
+    Understand compaction tuning
+  </Card>
+  <Card title="Merge Operators" icon="code-merge" href="/guides/merge-operators">
+    Configure merge operators
+  </Card>
+  <Card title="Checkpoints" icon="bookmark" href="/guides/checkpoints">
+    Configure checkpoint management
+  </Card>
+</CardGroup>

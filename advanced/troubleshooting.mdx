@@ -1,0 +1,506 @@
+---
+title: Troubleshooting
+description: Common issues, debugging tips, and logging configuration for SlateDB
+---
+
+# Troubleshooting
+
+This guide helps you diagnose and resolve common issues when working with SlateDB.
+
+## Common Issues
+
+### Database Closed Errors
+
+<AccordionGroup>
+  <Accordion title="Error: Closed (CloseReason::Clean)">
+    **Cause:** The database was shut down cleanly.
+    
+    **Solution:**
+    ```rust
+    // Check if database is closed before operations
+    if db.is_closed() {
+        // Re-open the database
+        let db = Db::open("/path/to/db", object_store).await?;
+    }
+    ```
+    
+    See `slatedb/src/error.rs:299` for close reasons.
+  </Accordion>
+  
+  <Accordion title="Error: Closed (CloseReason::Fenced)">
+    **Cause:** Another writer has taken ownership of the database (fencing operation).
+    
+    **Solution:**
+    - SlateDB enforces single-writer semantics
+    - Ensure only one writer process is active
+    - If the other writer has terminated, create a new database instance
+    
+    ```rust
+    // This will fence any previous writer
+    let db = Db::open("/path/to/db", object_store).await?;
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: Closed (CloseReason::Panic)">
+    **Cause:** One or more background tasks panicked.
+    
+    **Solution:**
+    - Check logs for panic messages
+    - Look for `BackgroundTaskPanic` errors in logs
+    - Report the issue on [GitHub](https://github.com/slatedb/slatedb/issues)
+  </Accordion>
+</AccordionGroup>
+
+### Object Storage Errors
+
+<AccordionGroup>
+  <Accordion title="Error: ObjectStoreError (NotFound)">
+    **Cause:** Required manifest or SST file is missing from object storage.
+    
+    **Possible causes:**
+    - Database corruption
+    - Premature garbage collection
+    - Object storage eventual consistency
+    - Manual deletion of objects
+    
+    **Solution:**
+    ```rust
+    // Check manifest state
+    // Increase min_age for garbage collection
+    let mut options = DbOptions::default();
+    if let Some(ref mut gc_opts) = options.garbage_collector_options {
+        if let Some(ref mut manifest_opts) = gc_opts.manifest_options {
+            manifest_opts.min_age = Duration::from_secs(86400); // 24 hours
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: ObjectStoreError (other)">
+    **Cause:** Network issues, permissions, or object storage service problems.
+    
+    **Solution:**
+    - Check network connectivity
+    - Verify object storage credentials
+    - Check object storage service status
+    - Enable debug logging to see full error details
+  </Accordion>
+  
+  <Accordion title="Error: TransactionalObjectTimeout">
+    **Cause:** Manifest update took too long (default: 300 seconds).
+    
+    **Solution:**
+    ```rust
+    let mut options = DbOptions::default();
+    options.manifest_update_timeout = Duration::from_secs(600); // 10 minutes
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Configuration Errors
+
+<AccordionGroup>
+  <Accordion title="Error: InvalidCachePartSize">
+    **Cause:** `part_size_bytes` is not a multiple of 1024 or is zero.
+    
+    **Solution:**
+    ```rust
+    let mut options = DbOptions::default();
+    options.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024; // 4MB
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: InvalidCompressionCodec">
+    **Cause:** Unsupported compression codec specified.
+    
+    **Solution:**
+    ```rust
+    use slatedb::config::CompressionCodec;
+    
+    // Use a supported codec
+    let mut options = DbOptions::default();
+    options.compression_codec = Some(CompressionCodec::Zstd);
+    ```
+    
+    Supported codecs (with features): Snappy, Zlib, Lz4, Zstd
+  </Accordion>
+  
+  <Accordion title="Error: InvalidConfigurationFormat">
+    **Cause:** Configuration file is malformed or has invalid values.
+    
+    **Solution:**
+    - Validate TOML/JSON/YAML syntax
+    - Check duration formats (e.g., `"100ms"`, `"1s"`)
+    - See configuration examples in `slatedb/src/config.rs:44-179`
+  </Accordion>
+</AccordionGroup>
+
+### Data Errors
+
+<AccordionGroup>
+  <Accordion title="Error: ChecksumMismatch">
+    **Cause:** Data corruption detected in SST file.
+    
+    **Possible causes:**
+    - Disk corruption
+    - Object storage corruption
+    - Network transmission errors
+    
+    **Solution:**
+    - Check object storage integrity
+    - Try re-reading from object storage
+    - If persistent, the data may be permanently corrupted
+  </Accordion>
+  
+  <Accordion title="Error: InvalidVersion">
+    **Cause:** SST or manifest file format version is unsupported.
+    
+    **Solution:**
+    - Use a compatible SlateDB version
+    - Check the error message for supported versions
+    - May need to migrate data to newer format
+  </Accordion>
+  
+  <Accordion title="Error: BlockDecompressionError">
+    **Cause:** Failed to decompress an SST block.
+    
+    **Solution:**
+    - Check that the compression feature is enabled
+    - Verify data integrity with checksums
+    - May indicate data corruption
+  </Accordion>
+</AccordionGroup>
+
+### Transaction Errors
+
+<AccordionGroup>
+  <Accordion title="Error: TransactionConflict">
+    **Cause:** Optimistic concurrency conflict detected.
+    
+    **Solution:**
+    ```rust
+    // Retry the transaction
+    loop {
+        let txn = db.transaction();
+        match perform_operations(&txn).await {
+            Ok(_) => break,
+            Err(e) if e.kind() == ErrorKind::Transaction => {
+                // Retry
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Debugging Tips
+
+### Enable Logging
+
+SlateDB uses the `log` crate. Configure logging to see detailed information:
+
+<Tabs>
+  <Tab title="env_logger">
+    ```rust
+    fn main() {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("slatedb=debug")
+        ).init();
+        
+        // Your code here
+    }
+    ```
+    
+    Run with:
+    ```bash
+    RUST_LOG=slatedb=debug cargo run
+    ```
+  </Tab>
+  
+  <Tab title="tracing-subscriber">
+    ```rust
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    
+    fn main() {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                std::env::var("RUST_LOG")
+                    .unwrap_or_else(|_| "slatedb=debug".into()),
+            ))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        
+        // Your code here
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Log Levels
+
+<CodeGroup>
+```bash Error Level
+RUST_LOG=slatedb=error cargo run
+```
+
+```bash Warn Level
+RUST_LOG=slatedb=warn cargo run
+```
+
+```bash Info Level
+RUST_LOG=slatedb=info cargo run
+```
+
+```bash Debug Level
+RUST_LOG=slatedb=debug cargo run
+```
+
+```bash Trace Level
+RUST_LOG=slatedb=trace cargo run
+```
+</CodeGroup>
+
+<Tip>
+Use `trace` level for maximum verbosity, but note it may impact performance.
+</Tip>
+
+### Inspect Database Statistics
+
+Monitor database health with statistics:
+
+```rust
+use slatedb::db_stats::*;
+
+let stats = db.stats();
+
+// Check for common issues
+let backpressure = stats.get(BACKPRESSURE_COUNT);
+if backpressure > 0 {
+    println!("Warning: {} backpressure events", backpressure);
+    println!("Consider increasing max_unflushed_bytes");
+}
+
+let l0_count = stats.get(L0_SST_COUNT);
+if l0_count > 20 {
+    println!("Warning: {} L0 SSTs", l0_count);
+    println!("Compaction may be falling behind");
+}
+
+let false_positives = stats.get(SST_FILTER_FALSE_POSITIVES);
+let positives = stats.get(SST_FILTER_POSITIVES);
+let fpr = false_positives as f64 / (false_positives + positives) as f64;
+println!("Bloom filter false positive rate: {:.2}%", fpr * 100.0);
+```
+
+<Info>
+Statistic names are defined in `slatedb/src/db_stats.rs:10-23`.
+</Info>
+
+### Check Manifest State
+
+Inspect the current manifest:
+
+```rust
+// Read the latest manifest
+let manifest = db.get_manifest().await?;
+
+println!("Manifest ID: {}", manifest.id);
+println!("L0 SSTs: {}", manifest.l0.len());
+println!("Compacted SSTs: {}", manifest.compacted.len());
+println!("Checkpoints: {}", manifest.checkpoints.len());
+```
+
+### Verify Object Storage Connection
+
+Test object storage access:
+
+```rust
+use object_store::{ObjectStore, path::Path};
+
+// Test write
+let test_path = Path::from("/test/connection");
+let test_data = bytes::Bytes::from("test");
+object_store.put(&test_path, test_data.clone()).await?;
+
+// Test read
+let result = object_store.get(&test_path).await?;
+let bytes = result.bytes().await?;
+assert_eq!(bytes, test_data);
+
+// Test delete
+object_store.delete(&test_path).await?;
+
+println!("Object storage connection verified");
+```
+
+## Performance Issues
+
+### Slow Reads
+
+<Steps>
+  <Step title="Check cache hit rates">
+    Monitor `sst_filter_negatives` vs `sst_filter_positives` statistics.
+  </Step>
+  
+  <Step title="Increase cache sizes">
+    ```rust
+    // Increase block cache
+    options.object_store_cache_options.max_cache_size_bytes = 
+        Some(32 * 1024 * 1024 * 1024); // 32GB
+    ```
+  </Step>
+  
+  <Step title="Enable disk cache">
+    ```rust
+    options.object_store_cache_options.root_folder = 
+        Some(PathBuf::from("/var/cache/slatedb"));
+    ```
+  </Step>
+  
+  <Step title="Check L0 SST count">
+    Too many L0 SSTs slow down reads. Ensure compaction is running.
+  </Step>
+</Steps>
+
+### Slow Writes
+
+<Steps>
+  <Step title="Check backpressure events">
+    Monitor `backpressure_count` statistic.
+  </Step>
+  
+  <Step title="Increase unflushed buffer">
+    ```rust
+    options.max_unflushed_bytes = 2 * 1024 * 1024 * 1024; // 2GB
+    ```
+  </Step>
+  
+  <Step title="Adjust flush interval">
+    ```rust
+    options.flush_interval = Some(Duration::from_millis(200));
+    ```
+  </Step>
+  
+  <Step title="Use non-blocking writes">
+    ```rust
+    let write_opts = WriteOptions { await_durable: false };
+    ```
+  </Step>
+</Steps>
+
+### High Memory Usage
+
+<Steps>
+  <Step title="Check total_mem_size_bytes">
+    Monitor memory usage via statistics.
+  </Step>
+  
+  <Step title="Reduce cache sizes">
+    Decrease block cache and disk cache limits.
+  </Step>
+  
+  <Step title="Reduce L0 SST size">
+    ```rust
+    options.l0_sst_size_bytes = 32 * 1024 * 1024; // 32MB
+    ```
+  </Step>
+  
+  <Step title="Limit unflushed bytes">
+    ```rust
+    options.max_unflushed_bytes = 512 * 1024 * 1024; // 512MB
+    ```
+  </Step>
+</Steps>
+
+## Error Reference
+
+Quick reference for error types defined in `slatedb/src/error.rs`:
+
+<AccordionGroup>
+  <Accordion title="Transaction Errors (ErrorKind::Transaction)">
+    - `TransactionConflict`: Retry the transaction
+  </Accordion>
+  
+  <Accordion title="Closed Errors (ErrorKind::Closed)">
+    - `Closed`: Database shut down cleanly
+    - `Fenced`: Another writer took ownership
+    - `BackgroundTaskPanic`: Internal task crashed
+  </Accordion>
+  
+  <Accordion title="Unavailable Errors (ErrorKind::Unavailable)">
+    - `IoError`: I/O operation failed
+    - `ObjectStoreError`: Object storage issue
+    - `FoyerError`: Cache error (Foyer only)
+    - `TransactionalObjectTimeout`: Manifest update timeout
+  </Accordion>
+  
+  <Accordion title="Invalid Errors (ErrorKind::Invalid)">
+    - `InvalidCachePartSize`: Bad cache configuration
+    - `InvalidCompressionCodec`: Unsupported codec
+    - `InvalidConfigurationFormat`: Bad config file
+    - `WalDisabled`: WAL operation when disabled
+    - `MergeOperatorMissing`: Merge op required but not set
+  </Accordion>
+  
+  <Accordion title="Data Errors (ErrorKind::Data)">
+    - `ChecksumMismatch`: Data corruption
+    - `InvalidVersion`: Unsupported format version
+    - `InvalidFlatbuffer`: Malformed SST
+    - `BlockDecompressionError`: Decompression failed
+    - `ManifestMissing`: Manifest not found
+  </Accordion>
+  
+  <Accordion title="Internal Errors (ErrorKind::Internal)">
+    - `CompactionExecutorFailed`: Compaction system error
+    - `BackgroundTaskExists`: Task already running
+    - Please [report these on GitHub](https://github.com/slatedb/slatedb/issues)
+  </Accordion>
+</AccordionGroup>
+
+## Getting Help
+
+<CardGroup cols={2}>
+  <Card 
+    title="GitHub Issues" 
+    icon="github"
+    href="https://github.com/slatedb/slatedb/issues"
+  >
+    Report bugs and request features
+  </Card>
+  
+  <Card 
+    title="Discord Community" 
+    icon="discord"
+    href="https://discord.gg/mHYmGy5MgA"
+  >
+    Get help from the community
+  </Card>
+  
+  <Card 
+    title="API Documentation" 
+    icon="book"
+    href="https://docs.rs/slatedb/latest/slatedb/"
+  >
+    Browse the Rust API docs
+  </Card>
+  
+  <Card 
+    title="Contributing Guide" 
+    icon="code-branch"
+    href="https://github.com/slatedb/slatedb/blob/main/CONTRIBUTING.md"
+  >
+    Learn how to contribute
+  </Card>
+</CardGroup>
+
+<Note>
+When reporting issues, include:
+- SlateDB version
+- Rust version
+- Object storage provider
+- Configuration settings
+- Relevant log output
+- Reproduction steps
+</Note>

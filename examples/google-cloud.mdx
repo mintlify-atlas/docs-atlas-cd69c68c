@@ -1,0 +1,527 @@
+---
+title: Google Cloud Storage Example
+description: Integrate SlateDB with Google Cloud Storage (GCS) as the backend object store
+---
+
+## Overview
+
+This example demonstrates how to configure SlateDB to use Google Cloud Storage (GCS) as the backend. SlateDB leverages the `object_store` crate's GCS implementation, providing seamless integration with Google Cloud's object storage service.
+
+## Complete Example
+
+```rust
+use object_store::gcp::GoogleCloudStorageBuilder;
+use slatedb::{config::PutOptions, Db};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Construct google cloud storage object store.
+    let gcs_store = Arc::new(
+        GoogleCloudStorageBuilder::new()
+            .with_service_account_path("<REPLACEWITHSERVICEACCOUNTPATH>")
+            .with_bucket_name("<REPLACEWITHBUCKETNAME>")
+            .build()?,
+    );
+
+    println!("Opening the db");
+    let path = "/tmp/slatedb_google_cloud_storage";
+    let db = Db::open(path, gcs_store.clone()).await?;
+
+    // Put a value and wait for the flush.
+    println!("Writing a value and waiting for flush");
+    db.put(b"k1", b"value1").await?;
+    println!("{:?}", db.get(b"k1").await?);
+
+    // Put 1000 keys, do not wait for it to be durable
+    println!("Writing 1000 keys without waiting for flush");
+    let write_options = slatedb::config::WriteOptions {
+        await_durable: false,
+    };
+    for i in 0..1000 {
+        db.put_with_options(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+            &PutOptions::default(),
+            &write_options,
+        )
+        .await?;
+    }
+
+    // Flush to make the writes durable.
+    println!("Flushing the writes and closing the db");
+    db.flush().await?;
+    db.close().await?;
+
+    // Reopen the db and read the value.
+    println!("Reopening the db");
+    let db_reopened = Db::open(path, gcs_store).await?;
+    println!("Reading the value from the reopened db");
+
+    // Read 20 keys
+    for i in 0..20 {
+        println!(
+            "{:?}",
+            db_reopened.get(format!("key{}", i).as_bytes()).await
+        );
+    }
+    db_reopened.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/google_cloud_storage.rs`
+
+## Prerequisites
+
+### Google Cloud Requirements
+
+1. **Google Cloud Project**: Active GCP project with billing enabled
+2. **GCS Bucket**: Existing Cloud Storage bucket
+3. **Service Account**: Service account with GCS access
+4. **Credentials**: Service account key file (JSON)
+
+### Setup Google Cloud Resources
+
+<Steps>
+  <Step title="Create GCS Bucket">
+    ```bash
+    gsutil mb -l us-east1 gs://my-slatedb-bucket
+    ```
+  </Step>
+  
+  <Step title="Create Service Account">
+    ```bash
+    gcloud iam service-accounts create slatedb-service \
+      --display-name="SlateDB Service Account"
+    ```
+  </Step>
+  
+  <Step title="Grant Bucket Permissions">
+    ```bash
+    gsutil iam ch serviceAccount:slatedb-service@PROJECT_ID.iam.gserviceaccount.com:objectAdmin \
+      gs://my-slatedb-bucket
+    ```
+  </Step>
+  
+  <Step title="Create and Download Key">
+    ```bash
+    gcloud iam service-accounts keys create ~/slatedb-key.json \
+      --iam-account=slatedb-service@PROJECT_ID.iam.gserviceaccount.com
+    ```
+  </Step>
+</Steps>
+
+## Configuration Options
+
+### Using Service Account Key File
+
+The recommended approach for authentication:
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_service_account_path("/path/to/service-account-key.json")
+        .with_bucket_name("my-slatedb-bucket")
+        .build()?,
+);
+```
+
+### Using Service Account Key String
+
+If you have the key content as a string:
+
+```rust
+let key_json = std::fs::read_to_string("/path/to/key.json")?;
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_service_account_key(key_json)
+        .with_bucket_name("my-slatedb-bucket")
+        .build()?,
+);
+```
+
+### Using Application Default Credentials
+
+For GCE VMs, Cloud Run, or gcloud CLI:
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_bucket_name("my-slatedb-bucket")
+        .build()?,
+);
+```
+
+This automatically uses:
+- Compute Engine/Cloud Run service account metadata
+- `gcloud auth application-default login` credentials
+- `GOOGLE_APPLICATION_CREDENTIALS` environment variable
+
+### Using Environment Variables
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+export GOOGLE_BUCKET="my-slatedb-bucket"
+```
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::from_env()
+        .build()?,
+);
+```
+
+## Running the Example
+
+### Step 1: Prepare Credentials
+
+Download your service account key file:
+
+```bash
+gcloud iam service-accounts keys create ~/slatedb-key.json \
+  --iam-account=slatedb-service@PROJECT_ID.iam.gserviceaccount.com
+```
+
+### Step 2: Update Code
+
+Edit `examples/src/google_cloud_storage.rs`:
+
+```rust
+.with_service_account_path("/home/user/slatedb-key.json")
+.with_bucket_name("my-slatedb-bucket")
+```
+
+### Step 3: Run Example
+
+```bash
+cd examples
+cargo run --bin google-cloud-storage
+```
+
+### Expected Output
+
+```
+Opening the db
+Writing a value and waiting for flush
+Some([118, 97, 108, 117, 101, 49])
+Writing 1000 keys without waiting for flush
+Flushing the writes and closing the db
+Reopening the db
+Reading the value from the reopened db
+Some([118, 97, 108, 117, 101, 48])
+Some([118, 97, 108, 117, 101, 49])
+...
+```
+
+## Development with Fake GCS Server
+
+For local development without GCP:
+
+### Install fake-gcs-server
+
+```bash
+# Using Docker
+docker run -d -p 4443:4443 \
+  -v /tmp/fake-gcs:/data \
+  fsouza/fake-gcs-server:latest \
+  -scheme http \
+  -port 4443
+```
+
+### Configure for Local Development
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_url("http://localhost:4443")
+        .with_bucket_name("my-slatedb-bucket")
+        .build()?,
+);
+```
+
+## Key Features Demonstrated
+
+### High-Throughput Writes
+
+Write many keys without waiting for each flush:
+
+```rust
+let write_options = slatedb::config::WriteOptions {
+    await_durable: false,
+};
+
+for i in 0..1000 {
+    db.put_with_options(
+        format!("key{}", i).as_bytes(),
+        format!("value{}", i).as_bytes(),
+        &PutOptions::default(),
+        &write_options,
+    ).await?;
+}
+```
+
+This batches writes for maximum throughput.
+
+### Explicit Flush
+
+Ensure all writes are durable:
+
+```rust
+db.flush().await?;
+```
+
+### Persistence and Recovery
+
+Reopen database with full state recovery:
+
+```rust
+let db_reopened = Db::open(path, gcs_store).await?;
+let value = db_reopened.get(b"k1").await?;
+```
+
+All data is automatically recovered from GCS.
+
+## Advanced Configuration
+
+### Custom Request Timeout
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_service_account_path("/path/to/key.json")
+        .with_bucket_name("my-slatedb-bucket")
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_timeout(std::time::Duration::from_secs(60))
+        )
+        .build()?,
+);
+```
+
+### Custom Project ID
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_service_account_path("/path/to/key.json")
+        .with_bucket_name("my-slatedb-bucket")
+        .with_google_cloud_project("my-project-id")
+        .build()?,
+);
+```
+
+### Custom GCS Endpoint
+
+For private GCS endpoints or regional endpoints:
+
+```rust
+let gcs_store = Arc::new(
+    GoogleCloudStorageBuilder::new()
+        .with_service_account_path("/path/to/key.json")
+        .with_bucket_name("my-slatedb-bucket")
+        .with_url("https://storage-us-east1.googleapis.com")
+        .build()?,
+);
+```
+
+## Storage Structure
+
+SlateDB organizes data in GCS:
+
+```
+my-slatedb-bucket/
+  tmp/
+    slatedb_google_cloud_storage/
+      manifest.json          # Database metadata
+      compacted/
+        00001.sst            # Compacted SST files
+        00002.sst
+      wal/
+        00001.wal            # Write-ahead log
+      checkpoints/           # Checkpoint data
+```
+
+## IAM Permissions
+
+Your service account needs these permissions:
+
+```yaml
+roles/storage.objectAdmin  # Full object access (recommended)
+```
+
+Or create a custom role with minimal permissions:
+
+```yaml
+storage.objects.create
+storage.objects.delete
+storage.objects.get
+storage.objects.list
+storage.objects.update
+```
+
+### Apply Custom Role
+
+```bash
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:slatedb-service@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None
+```
+
+## Performance Considerations
+
+### Throughput
+
+- GCS supports 5,000 writes per second per prefix
+- Reads are virtually unlimited
+- Use multi-region buckets for global access
+- Consider dual-region for balance of performance and cost
+
+### Latency
+
+- Typical latency: 10-50ms
+- Multi-region buckets: Higher latency, higher availability
+- Single-region: Lower latency, lower cost
+- Use regions close to compute for best performance
+
+### Cost Optimization
+
+<AccordionGroup>
+  <Accordion title="Storage Classes">
+    - **Standard**: Frequently accessed data
+    - **Nearline**: Once per month access
+    - **Coldline**: Once per quarter access
+    - **Archive**: Once per year access
+  </Accordion>
+  
+  <Accordion title="Lifecycle Policies">
+    ```bash
+    gsutil lifecycle set lifecycle.json gs://my-slatedb-bucket
+    ```
+    
+    `lifecycle.json`:
+    ```json
+    {
+      "rule": [
+        {
+          "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+          "condition": {"age": 30}
+        },
+        {
+          "action": {"type": "Delete"},
+          "condition": {"age": 365}
+        }
+      ]
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Request Costs">
+    - Minimize Class A operations (writes)
+    - Batch writes when possible
+    - Use SlateDB's built-in caching
+    - Monitor costs in Cloud Console
+  </Accordion>
+</AccordionGroup>
+
+## Security Best Practices
+
+### Use Workload Identity
+
+For GKE clusters, use Workload Identity instead of service account keys:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  slatedb-service@PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:PROJECT_ID.svc.id.goog[NAMESPACE/KSA_NAME]"
+```
+
+### Enable Encryption
+
+GCS encrypts data at rest by default. For additional security:
+
+- Use customer-managed encryption keys (CMEK)
+- Enable uniform bucket-level access
+- Use VPC Service Controls
+
+### Secure Service Account Keys
+
+<Warning>
+  Service account keys are sensitive credentials. Never commit them to version control.
+</Warning>
+
+```bash
+# Store in environment variable
+export GOOGLE_APPLICATION_CREDENTIALS="/secure/path/to/key.json"
+chmod 600 /secure/path/to/key.json
+```
+
+## Troubleshooting
+
+### Authentication Errors
+
+**Error**: "Could not load credentials"
+
+**Solutions**:
+- Verify service account key file exists and is readable
+- Check JSON key file is valid (not corrupted)
+- Ensure `GOOGLE_APPLICATION_CREDENTIALS` points to correct file
+- Verify service account has not been deleted or disabled
+
+### Permission Errors
+
+**Error**: "403 Forbidden"
+
+**Solutions**:
+- Check service account has required GCS permissions
+- Verify bucket exists and is in the correct project
+- Check bucket IAM policies
+- Ensure API is enabled: `gcloud services enable storage.googleapis.com`
+
+### Bucket Not Found
+
+**Error**: "404 Not Found"
+
+**Solutions**:
+- Verify bucket name is correct (case-sensitive)
+- Check bucket exists: `gsutil ls gs://my-slatedb-bucket`
+- Ensure service account has permission to list buckets
+- Confirm you're using the correct GCP project
+
+### Network Issues
+
+**Error**: "Failed to connect"
+
+**Solutions**:
+- Check internet connectivity
+- Verify firewall allows outbound HTTPS (port 443)
+- For private GCS, verify VPC configuration
+- Check if using VPC Service Controls
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="S3 Storage" icon="aws" href="/examples/s3-storage">
+    Use AWS S3 as backend
+  </Card>
+  <Card title="Azure Blob Storage" icon="microsoft" href="/examples/azure-blob">
+    Integrate with Azure
+  </Card>
+  <Card title="Standalone Compactor" icon="server" href="/examples/standalone-compactor">
+    Run compaction separately
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Customize database settings
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [object_store GCP documentation](https://docs.rs/object_store/latest/object_store/gcp/index.html)
+- [Google Cloud Storage documentation](https://cloud.google.com/storage/docs)
+- [GCS pricing calculator](https://cloud.google.com/products/calculator)
+- [Service account best practices](https://cloud.google.com/iam/docs/best-practices-service-accounts)
+- [fake-gcs-server](https://github.com/fsouza/fake-gcs-server)

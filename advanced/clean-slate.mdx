@@ -1,0 +1,139 @@
+---
+title: Clean Slate
+description: SlateDB's philosophy for building a simple, incremental, and empirical storage engine
+---
+
+# Clean Slate
+
+We want to build SlateDB with a single ethos that helps the community work together in a positive and collaborative way. This document describes Clean Slate, SlateDB's style guide. The guide is meant to clarify why and how we make changes to the project. This includes:
+
+- How we decide which features should be added to SlateDB and which should be left out.
+- How new features should be designed and implemented.
+- How we evaluate changes to the project governance and decision-making processes.
+
+## Vision
+
+<Note>
+We believe that the future of object storage is multi-region, low latency buckets that support atomic compare-and-swap operations. Inspired by [The Cloud Storage Triad: Latency, Cost, Durability](https://materializedview.io/p/cloud-storage-triad-latency-cost-durability), we set out to build a storage engine built for the cloud. SlateDB is that storage engine.
+
+— [Building a Cloud Native LSM on Object Storage by Chris Riccomini & Rohan Desai](https://www.youtube.com/watch?v=8L_4kWhdzNc), P99 CONF 2024
+</Note>
+
+Our vision of, "a storage engine built for the cloud," is an embedded key-value store that...
+
+- uses object storage as the source of truth,
+- caches efficiently across all tiers,
+- provides transactions and snapshots,
+- and is easy to run in the cloud.
+
+## Features
+
+This vision has led us to support the following features in SlateDB:
+
+<AccordionGroup>
+  <Accordion title="Zero-disk architecture">
+    SlateDB should be capable of running without any disks. Object storage is always the only source of truth.
+  </Accordion>
+  
+  <Accordion title="Single-writer">
+    SlateDB only needs to support one writer process at a time. SlateDB should enforce this property. Applications that need multiple writers should use multiple SlateDB databases as partitions.
+  </Accordion>
+  
+  <Accordion title="Multi-reader">
+    SlateDB allows multiple processes, potentially across multiple machines, to read from a single SlateDB database.
+  </Accordion>
+  
+  <Accordion title="Read caching">
+    SlateDB should cache reads to improve performance and reduce cloud API costs.
+  </Accordion>
+  
+  <Accordion title="Snapshot isolation">
+    Readers should be able to read from a consistent view of the database at a point in time.
+  </Accordion>
+  
+  <Accordion title="Transactions">
+    Writers should be able to write transactions atomically.
+  </Accordion>
+  
+  <Accordion title="Pluggable compaction">
+    Compaction is a never-ending research project with different options suitable for different workloads. SlateDB should have a pluggable compaction layer capable of running as a separate process on a separate machine.
+  </Accordion>
+</AccordionGroup>
+
+### Deliberately Avoided Features
+
+We have deliberately chosen to avoid the following features:
+
+<CardGroup cols={2}>
+  <Card title="Server or Network Protocol" icon="server">
+    SlateDB is an embeddable library only.
+  </Card>
+  
+  <Card title="OLAP & Columnar Storage" icon="table-columns">
+    SlateDB is row based.
+  </Card>
+</CardGroup>
+
+## Style
+
+Clean Slate lives in service of our vision. SlateDB is a transactional database, so ACID semantics are paramount. To build an ACID-compliant database comfortably, Clean Slate is simple, incremental, and empirical. We make changes incrementally. Changes that add complexity must justify the change with empirical evidence.
+
+Clean Slate manifests itself in many ways. Here are a few examples:
+
+<AccordionGroup>
+  <Accordion title="We will usually not implement the latest research ideas">
+    If we do, we will have a strong reason to do so.
+  </Accordion>
+  
+  <Accordion title="We will not always prioritize performance">
+    SlateDB must be fast enough to service the use cases we envision for it. SlateDB does not need to be as fast as possible, especially when it comes at the cost of simplicity.
+  </Accordion>
+  
+  <Accordion title="We prioritize readable code">
+    Rather than leveraging all language features.
+  </Accordion>
+  
+  <Accordion title="We will hard-code some configurations">
+    To keep the number of user-facing options low.
+  </Accordion>
+  
+  <Accordion title="We default to copying RocksDB, LevelDB, Badger, or Pebble">
+    Whenever possible. They are excellent databases that work empirically well.
+  </Accordion>
+  
+  <Accordion title="Our governance model and release process are simple">
+    And can be changed as we see fit.
+  </Accordion>
+  
+  <Accordion title="We have a separate Go project">
+    Where Go developers are building a Go implementation of SlateDB. This project is part of SlateDB but not governed by SlateDB's GOVERNANCE.md and CLEAN_SLATE.md.
+  </Accordion>
+</AccordionGroup>
+
+## References
+
+<CardGroup cols={2}>
+  <Card 
+    title="Define use cases, features, and requirements" 
+    icon="github"
+    href="https://github.com/slatedb/slatedb/issues/20"
+  >
+    GitHub Issue #20
+  </Card>
+  
+  <Card 
+    title="What Istio Got Wrong" 
+    icon="video"
+    href="https://youtu.be/XW10IpsTmH8?si=8DCg3BdFdGdfbmTe"
+  >
+    Learnings from the Last Seven Years of Service Mesh
+  </Card>
+  
+  <Card 
+    title="Tiger Style" 
+    icon="github"
+    href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md"
+  >
+    TigerBeetle's style guide
+  </Card>
+</CardGroup>

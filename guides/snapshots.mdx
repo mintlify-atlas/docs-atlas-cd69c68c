@@ -1,0 +1,403 @@
+---
+title: 'Snapshots'
+description: 'Create consistent point-in-time views of your database'
+---
+
+Snapshots provide read-only, consistent views of your database at a specific point in time. They're perfect for long-running queries, backups, and read replicas that need a stable view of data.
+
+## Creating Snapshots
+
+### Basic Snapshot Creation
+
+Create a snapshot of the current database state:
+
+```rust
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = /* open database */;
+    
+    // Write some data
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    
+    // Snapshot provides read-only access
+    let value = snapshot.get(b"key1").await?;
+    assert_eq!(value, Some("value1".into()));
+    
+    Ok(())
+}
+```
+
+<Note>
+Snapshots are created instantly and don't block writes. They capture a consistent view at the moment of creation using sequence numbers.
+</Note>
+
+## Reading from Snapshots
+
+### Get Operations
+
+Read values from a snapshot:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Simple get
+if let Some(value) = snapshot.get(b"key").await? {
+    println!("Value: {:?}", value);
+}
+
+// Get with options
+use slatedb::config::ReadOptions;
+let options = ReadOptions {
+    cache_blocks: true,
+    ..Default::default()
+};
+let value = snapshot.get_with_options(b"key", &options).await?;
+```
+
+### Range Scans
+
+Perform range queries on snapshots:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Scan a range
+let mut iter = snapshot.scan(b"key1".to_vec()..b"key9".to_vec()).await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+
+// Prefix scan
+let mut iter = snapshot.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    // Process keys
+}
+```
+
+## Snapshot Isolation
+
+Snapshots see a consistent view of data and are isolated from concurrent writes:
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = /* open database */;
+    
+    // Write initial data
+    db.put(b"key1", b"original_value").await?;
+    
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    
+    // Modify data after snapshot creation
+    db.put(b"key1", b"modified_value").await?;
+    db.put(b"key2", b"new_key").await?;
+    
+    // Snapshot still sees original data
+    assert_eq!(
+        snapshot.get(b"key1").await?,
+        Some(Bytes::from("original_value"))
+    );
+    
+    // Snapshot doesn't see new keys
+    assert_eq!(snapshot.get(b"key2").await?, None);
+    
+    // Database sees updated data
+    assert_eq!(
+        db.get(b"key1").await?,
+        Some(Bytes::from("modified_value"))
+    );
+    
+    Ok(())
+}
+```
+
+## Practical Use Cases
+
+### Consistent Backups
+
+Create a snapshot for backing up data:
+
+```rust
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+
+async fn backup_to_file(db: &Db, path: &str) -> Result<(), Error> {
+    // Create snapshot for consistent backup
+    let snapshot = db.snapshot().await?;
+    
+    let mut file = File::create(path).await?;
+    
+    // Export all data from snapshot
+    let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        // Write key-value to backup file
+        file.write_all(&kv.key).await?;
+        file.write_all(b"=").await?;
+        file.write_all(&kv.value).await?;
+        file.write_all(b"\n").await?;
+    }
+    
+    Ok(())
+}
+```
+
+### Read Replicas
+
+Use snapshots for read-only replicas:
+
+```rust
+async fn serve_read_replica(db: &Db) -> Result<(), Error> {
+    // Create snapshot for read replica
+    let snapshot = db.snapshot().await?;
+    
+    // Serve queries from snapshot
+    loop {
+        // Handle read requests using snapshot
+        let query_key = /* receive query */;
+        let result = snapshot.get(query_key).await?;
+        // Send result back
+    }
+}
+```
+
+### Long-Running Analytics
+
+Run analytical queries on a consistent view:
+
+```rust
+async fn compute_analytics(db: &Db) -> Result<AnalyticsReport, Error> {
+    // Create snapshot for analysis
+    let snapshot = db.snapshot().await?;
+    
+    let mut total_count = 0;
+    let mut sum = 0;
+    
+    // Iterate over all data consistently
+    let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        total_count += 1;
+        // Aggregate data
+        sum += parse_value(&kv.value);
+    }
+    
+    Ok(AnalyticsReport {
+        count: total_count,
+        average: sum / total_count,
+    })
+}
+```
+
+## Scanning Snapshots
+
+Complete example of scanning a snapshot:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use slatedb::config::Settings;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_settings(Settings::default())
+        .build()
+        .await?;
+    
+    // Write test data
+    db.put(b"apple", b"red").await?;
+    db.put(b"banana", b"yellow").await?;
+    db.put(b"cherry", b"red").await?;
+    
+    // Create snapshot
+    let snapshot = db.snapshot().await?;
+    println!("Snapshot created");
+    
+    // Modify data after snapshot
+    db.put(b"apple", b"green").await?;
+    db.put(b"date", b"brown").await?;
+    db.delete(b"banana").await?;
+    
+    // Scan snapshot - sees original data
+    println!("\nSnapshot contents:");
+    let mut snapshot_iter = snapshot.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = snapshot_iter.next().await? {
+        println!("  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    // Output:
+    //   apple: red
+    //   banana: yellow
+    //   cherry: red
+    
+    // Scan database - sees updated data
+    println!("\nCurrent database contents:");
+    let mut db_iter = db.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = db_iter.next().await? {
+        println!("  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    // Output:
+    //   apple: green
+    //   cherry: red
+    //   date: brown
+    
+    Ok(())
+}
+```
+
+## Key-Value Metadata
+
+Access full row metadata from snapshots:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+if let Some(kv) = snapshot.get_key_value(b"key").await? {
+    println!("Key: {:?}", kv.key);
+    println!("Value: {:?}", kv.value);
+    println!("Sequence: {}", kv.seq);
+    println!("Created at: {:?}", kv.create_ts);
+    println!("Expires at: {:?}", kv.expire_ts);
+}
+```
+
+## Snapshot Lifecycle
+
+### Automatic Cleanup
+
+Snapshots are automatically cleaned up when dropped:
+
+```rust
+{
+    let snapshot = db.snapshot().await?;
+    // Use snapshot...
+    
+    // Snapshot is automatically cleaned up when it goes out of scope
+}
+
+// Snapshot resources are released here
+```
+
+### Multiple Concurrent Snapshots
+
+You can have multiple active snapshots:
+
+```rust
+let snapshot1 = db.snapshot().await?;
+
+// Make some changes
+db.put(b"key", b"value1").await?;
+
+let snapshot2 = db.snapshot().await?;
+
+// Make more changes
+db.put(b"key", b"value2").await?;
+
+let snapshot3 = db.snapshot().await?;
+
+// Each snapshot sees data at its creation time
+assert_eq!(snapshot1.get(b"key").await?, None);
+assert_eq!(snapshot2.get(b"key").await?, Some("value1".into()));
+assert_eq!(snapshot3.get(b"key").await?, Some("value2".into()));
+```
+
+<Warning>
+Holding snapshots open for long periods can prevent garbage collection of old data. Release snapshots when you're done with them.
+</Warning>
+
+## Snapshot Options
+
+Customize snapshot read behavior:
+
+```rust
+use slatedb::config::{ReadOptions, ScanOptions};
+
+let snapshot = db.snapshot().await?;
+
+// Get with options
+let read_opts = ReadOptions {
+    cache_blocks: false,  // Don't pollute cache
+    ..Default::default()
+};
+let value = snapshot.get_with_options(b"key", &read_opts).await?;
+
+// Scan with options
+let scan_opts = ScanOptions {
+    read_ahead_bytes: 16384,
+    cache_blocks: false,
+    ..Default::default()
+};
+let iter = snapshot.scan_with_options(b"a"..b"z", &scan_opts).await?;
+```
+
+## Comparison with Checkpoints
+
+Snapshots vs Checkpoints:
+
+| Feature | Snapshots | Checkpoints |
+|---------|-----------|-------------|
+| **Purpose** | In-process consistent reads | Durable recovery points |
+| **Lifetime** | Process lifetime | Persisted in object storage |
+| **Creation** | Instant | Requires flush |
+| **Use Case** | Analytics, backups | Recovery, cloning |
+| **Cost** | Very low | Requires storage |
+
+See the [Checkpoints guide](/guides/checkpoints) for durable recovery points.
+
+## Best Practices
+
+<Steps>
+  <Step title="Release Snapshots Promptly">
+    Drop snapshots when done to allow garbage collection of old data.
+  </Step>
+  
+  <Step title="Use for Read-Heavy Workloads">
+    Snapshots are ideal for analytical queries that need consistency without blocking writes.
+  </Step>
+  
+  <Step title="Combine with Range Scans">
+    Snapshots work great with range queries for processing collections of data.
+  </Step>
+  
+  <Step title="Consider Cache Settings">
+    Disable block caching for one-time scans to avoid cache pollution.
+  </Step>
+</Steps>
+
+<Tip>
+Snapshots are lightweight and created using sequence numbers. There's minimal overhead to creating many snapshots.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Checkpoints" icon="bookmark" href="/guides/checkpoints">
+    Create durable recovery points
+  </Card>
+  <Card title="Range Queries" icon="arrows-left-right" href="/guides/range-queries">
+    Scan ranges efficiently
+  </Card>
+  <Card title="Transactions" icon="code-branch" href="/guides/transactions">
+    Use transactions for writes
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Learn fundamental operations
+  </Card>
+</CardGroup>

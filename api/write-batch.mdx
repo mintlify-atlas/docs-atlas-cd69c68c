@@ -1,0 +1,316 @@
+---
+title: "WriteBatch"
+description: "Atomic batch operations for SlateDB"
+---
+
+The `WriteBatch` struct allows you to group multiple write operations (put, delete, merge) and execute them atomically. All operations in a batch are assigned the same sequence number and applied together.
+
+## Creating a Batch
+
+### `WriteBatch::new`
+
+```rust
+pub fn new() -> Self
+```
+
+Creates a new empty write batch.
+
+<ResponseField name="WriteBatch" type="WriteBatch">
+  A new empty batch instance
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+```
+
+## Adding Operations
+
+### `put`
+
+```rust
+pub fn put<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Adds a put operation to the batch.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  Key to write (cannot be empty, max size u16::MAX)
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  Value to write (max size u32::MAX)
+</ParamField>
+
+**Example**
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+```
+
+**Panics**
+- If the key is empty
+- If the key size exceeds u16::MAX
+- If the value size exceeds u32::MAX
+
+### `put_with_options`
+
+```rust
+pub fn put_with_options<K, V>(
+    &mut self,
+    key: K,
+    value: V,
+    options: &PutOptions,
+)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Adds a put operation with custom options (e.g., TTL).
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  Key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  Value to write
+</ParamField>
+
+<ParamField path="options" type="&PutOptions" required>
+  Put options (e.g., `PutOptions { ttl: Ttl::ExpireAfter(3600) }`)
+</ParamField>
+
+**Example**
+
+```rust
+use slatedb::{WriteBatch, config::{PutOptions, Ttl}};
+
+let mut batch = WriteBatch::new();
+batch.put_with_options(
+    b"session",
+    b"data",
+    &PutOptions { ttl: Ttl::ExpireAfter(3600) } // 1 hour TTL
+);
+```
+
+### `delete`
+
+```rust
+pub fn delete<K: AsRef<[u8]>>(&mut self, key: K)
+```
+
+Adds a delete operation to the batch.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  Key to delete (cannot be empty)
+</ParamField>
+
+**Example**
+
+```rust
+let mut batch = WriteBatch::new();
+batch.delete(b"old_key");
+```
+
+**Panics**
+- If the key is empty
+- If the key size exceeds u16::MAX
+
+### `merge`
+
+```rust
+pub fn merge<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Adds a merge operation to the batch.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  Key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  Merge operand to apply
+</ParamField>
+
+**Example**
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"counter", b"\x01\x00\x00\x00"); // increment by 1
+```
+
+**Note:** The database must be configured with a merge operator for merge operations to work.
+
+### `merge_with_options`
+
+```rust
+pub fn merge_with_options<K, V>(
+    &mut self,
+    key: K,
+    value: V,
+    options: &MergeOptions,
+)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Adds a merge operation with custom options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  Key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  Merge operand to apply
+</ParamField>
+
+<ParamField path="options" type="&MergeOptions" required>
+  Merge options (e.g., TTL)
+</ParamField>
+
+## Batch Properties
+
+### `is_empty`
+
+```rust
+pub fn is_empty(&self) -> bool
+```
+
+Checks if the batch contains no operations.
+
+<ResponseField name="bool" type="bool">
+  Returns `true` if the batch is empty, `false` otherwise
+</ResponseField>
+
+## Writing a Batch
+
+Once you've added operations to a batch, write it to the database using `Db::write` or `Db::write_with_options`:
+
+```rust
+use slatedb::{Db, WriteBatch};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    let mut batch = WriteBatch::new();
+    batch.put(b"key1", b"value1");
+    batch.put(b"key2", b"value2");
+    batch.delete(b"old_key");
+    
+    let handle = db.write(batch).await?;
+    println!("Batch committed at seqnum: {}", handle.seqnum());
+    
+    Ok(())
+}
+```
+
+## Behavior Notes
+
+### Deduplication
+
+If you add multiple `put` or `delete` operations for the same key, only the last operation is kept:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key", b"value1");
+batch.put(b"key", b"value2"); // Overwrites previous put
+// Only "value2" will be written
+```
+
+However, `merge` operations are **not** deduplicated:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"counter", b"\x01");
+batch.merge(b"counter", b"\x01"); // Both merges are preserved
+// Both merge operations will be applied
+```
+
+### Atomicity
+
+All operations in a batch are applied atomically. The batch is assigned a single sequence number, and all operations are written together to the WAL (or memtable if WAL is disabled). Other operations will not interleave with batch operations.
+
+### Size Limits
+
+`WriteBatch` has no built-in size limit. However:
+- Large batches may exceed `l0_sst_size_bytes` when WAL is disabled
+- Large batches will create large WAL SSTs
+- Memory pressure from large batches may trigger backpressure
+
+### Mixed Operations
+
+You can mix puts, deletes, and merges in a single batch:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.delete(b"key2");
+batch.merge(b"counter", b"\x01");
+batch.put(b"key3", b"value3");
+```
+
+## WriteHandle
+
+When you write a batch, you receive a `WriteHandle` with metadata about the write:
+
+```rust
+pub struct WriteHandle {
+    seq: u64,
+    create_ts: i64,
+}
+```
+
+### `seqnum`
+
+```rust
+pub fn seqnum(&self) -> u64
+```
+
+Returns the sequence number assigned to the write.
+
+<ResponseField name="u64" type="u64">
+  Sequence number for this write operation
+</ResponseField>
+
+### `create_ts`
+
+```rust
+pub fn create_ts(&self) -> i64
+```
+
+Returns the creation timestamp assigned to the write.
+
+<ResponseField name="i64" type="i64">
+  Creation timestamp (Unix time in milliseconds)
+</ResponseField>
+
+**Example**
+
+```rust
+let handle = db.write(batch).await?;
+println!("Write seqnum: {}", handle.seqnum());
+println!("Write timestamp: {}", handle.create_ts());
+
+// Wait for the write to become durable
+let mut status = db.subscribe();
+status.wait_for(|s| s.durable_seq >= handle.seqnum())
+    .await
+    .expect("db dropped");
+```

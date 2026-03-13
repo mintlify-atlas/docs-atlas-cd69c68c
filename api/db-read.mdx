@@ -1,0 +1,445 @@
+---
+title: 'DbRead Trait'
+description: 'Unified trait for read-only database operations'
+---
+
+## Overview
+
+The `DbRead` trait defines a unified interface for reading data from SlateDB. This trait is implemented by `Db`, `DbReader`, and `DbSnapshot` to provide consistent read-only operations across different database access patterns.
+
+The trait is designed to be object-safe, allowing for dynamic dispatch when needed. This enables writing code that works with any implementor of `DbRead` without knowing the specific type at compile time.
+
+## Implementations
+
+The `DbRead` trait is implemented by:
+
+- **`Db`** - The main database interface with full read-write access
+- **`DbReader`** - A read-only interface for accessing persistent database state
+- **`DbSnapshot`** - A point-in-time snapshot for consistent reads
+
+## Methods
+
+### get
+
+```rust
+async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with default read options.
+
+The `Bytes` object returned contains a slice of an entire 4 KiB block. The block will be held in memory as long as the caller holds a reference to the `Bytes` object. Consider copying the data if you need to hold it for a long time.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  - `Ok(Some(Bytes))` - The value if it exists
+  - `Ok(None)` - If the key does not exist
+  - `Err(Error)` - If there was an error reading from the database
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    
+    // Using DbRead trait
+    let value = db.get(b"key1").await?;
+    assert_eq!(value, Some(bytes::Bytes::from("value1")));
+    
+    Ok(())
+}
+```
+
+---
+
+### get_with_options
+
+```rust
+async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to control the behavior:
+  - `durability_filter` - Minimum durability level for returned data
+  - `dirty` - Whether to include uncommitted data
+  - `cache_blocks` - Whether to cache fetched blocks
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  - `Ok(Some(Bytes))` - The value if it exists
+  - `Ok(None)` - If the key does not exist
+  - `Err(Error)` - If there was an error reading from the database
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead, config::ReadOptions, config::DurabilityLevel};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    
+    // Only read data that's been durably stored in object storage
+    let options = ReadOptions::new()
+        .with_durability_filter(DurabilityLevel::Remote);
+    
+    let value = db.get_with_options(b"key1", &options).await?;
+    
+    Ok(())
+}
+```
+
+---
+
+### get_key_value
+
+```rust
+async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the database with default read options.
+
+Returns the key along with its value and metadata (sequence number, creation timestamp, expiration timestamp). Unlike `get`, which returns only the value bytes, this method returns a `KeyValue` that includes row metadata.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  - `Ok(Some(KeyValue))` - If the key exists and is not deleted/expired
+  - `Ok(None)` - If the key does not exist or is deleted/expired
+  - `Err(Error)` - If there was an error reading from the database
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    
+    // Get key-value with metadata
+    let kv = db.get_key_value(b"key1").await?;
+    if let Some(kv) = kv {
+        println!("Key: {:?}", kv.key);
+        println!("Value: {:?}", kv.value);
+        println!("Sequence: {}", kv.seq);
+        println!("Created at: {}", kv.create_ts);
+        println!("Expires at: {:?}", kv.expire_ts);
+    }
+    
+    Ok(())
+}
+```
+
+---
+
+### get_key_value_with_options
+
+```rust
+async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the database with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to control the behavior
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  - `Ok(Some(KeyValue))` - If the key exists and is not deleted/expired
+  - `Ok(None)` - If the key does not exist or is deleted/expired
+  - `Err(Error)` - If there was an error reading from the database
+</ResponseField>
+
+---
+
+### scan
+
+```rust
+async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys using the default scan options.
+
+Returns a `DbIterator` that can be used to iterate over key-value pairs in the specified range.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan. Can be:
+  - `..` - Full range scan
+  - `key..` - Scan from key to end
+  - `..key` - Scan from start to key
+  - `key1..key2` - Scan between two keys
+  - `key1..=key2` - Inclusive range
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  - `Ok(DbIterator)` - An iterator for the scan results
+  - `Err(Error)` - If there was an error initiating the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    db.put(b"key3", b"value3").await?;
+    
+    // Scan a range
+    let mut iter = db.scan(b"key1"..b"key3").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_with_options
+
+```rust
+async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys with custom scan options.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to control the behavior:
+  - `durability_filter` - Minimum durability level
+  - `dirty` - Whether to include uncommitted data
+  - `read_ahead_bytes` - Number of bytes to prefetch
+  - `cache_blocks` - Whether to cache blocks
+  - `max_fetch_tasks` - Concurrent fetch tasks
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  - `Ok(DbIterator)` - An iterator for the scan results
+  - `Err(Error)` - If there was an error initiating the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead, config::ScanOptions};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Configure scan with read-ahead for better performance
+    let options = ScanOptions::new()
+        .with_read_ahead_bytes(1024 * 1024)
+        .with_max_fetch_tasks(4)
+        .with_cache_blocks(true);
+    
+    let mut iter = db.scan_with_options(.., &options).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_prefix
+
+```rust
+async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix using the default scan options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan for
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  - `Ok(DbIterator)` - An iterator for keys with the specified prefix
+  - `Err(Error)` - If there was an error initiating the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, DbRead};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"user:1:name", b"Alice").await?;
+    db.put(b"user:1:email", b"alice@example.com").await?;
+    db.put(b"user:2:name", b"Bob").await?;
+    db.put(b"product:1", b"Widget").await?;
+    
+    // Scan all keys with "user:1:" prefix
+    let mut iter = db.scan_prefix(b"user:1:").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+    // Prints:
+    // Key: "user:1:email", Value: "alice@example.com"
+    // Key: "user:1:name", Value: "Alice"
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_prefix_with_options
+
+```rust
+async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix with custom scan options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan for
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to control the behavior
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  - `Ok(DbIterator)` - An iterator for keys with the specified prefix
+  - `Err(Error)` - If there was an error initiating the scan
+</ResponseField>
+
+## Related Types
+
+### ReadOptions
+
+```rust
+pub struct ReadOptions {
+    pub durability_filter: DurabilityLevel,
+    pub dirty: bool,
+    pub cache_blocks: bool,
+}
+```
+
+See [Settings](/api/settings) for more configuration details.
+
+### ScanOptions
+
+```rust
+pub struct ScanOptions {
+    pub durability_filter: DurabilityLevel,
+    pub dirty: bool,
+    pub read_ahead_bytes: usize,
+    pub cache_blocks: bool,
+    pub max_fetch_tasks: usize,
+}
+```
+
+### KeyValue
+
+```rust
+pub struct KeyValue {
+    pub key: Bytes,
+    pub value: Bytes,
+    pub seq: u64,
+    pub create_ts: i64,
+    pub expire_ts: Option<i64>,
+}
+```
+
+Represents a key-value pair with metadata.
+
+## Usage Notes
+
+<Note>
+  The `Bytes` objects returned by `get` methods contain a slice of an entire 4 KiB block. The block will be held in memory as long as the caller holds a reference to the `Bytes` object. Consider copying the data if you need to hold it for a long time.
+</Note>
+
+<Warning>
+  For `DbReader`, the `ReadOptions::durability_filter` has no effect since readers can only observe committed state.
+</Warning>

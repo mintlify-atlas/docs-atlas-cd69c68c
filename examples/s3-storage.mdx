@@ -1,0 +1,364 @@
+---
+title: S3 Storage Example
+description: Connect SlateDB to AWS S3 or S3-compatible storage like LocalStack, MinIO, and Wasabi
+---
+
+## Overview
+
+This example demonstrates how to configure SlateDB to use Amazon S3 or any S3-compatible object storage as the backend. SlateDB leverages the `object_store` crate's S3 implementation, which supports AWS S3, LocalStack, MinIO, DigitalOcean Spaces, Wasabi, and other S3-compatible services.
+
+## Complete Example
+
+```rust
+use object_store::aws::S3ConditionalPut;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            // These will be different if you are using real AWS
+            .with_allow_http(true)
+            .with_endpoint("http://localhost:4566")
+            .with_access_key_id("test")
+            .with_secret_access_key("test")
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let db = Db::open("/tmp/slatedb_s3_compatible", object_store.clone()).await?;
+
+    // Call db.put with a key and a 64 meg value to trigger L0 SST flush
+    let value: Vec<u8> = vec![0; 64 * 1024 * 1024];
+    db.put(b"k1", value.as_slice()).await?;
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/s3_compatible.rs`
+
+## Prerequisites
+
+### For LocalStack (Development)
+
+1. **Install LocalStack**:
+   ```bash
+   pip install localstack
+   ```
+
+2. **Start LocalStack**:
+   ```bash
+   localstack start
+   ```
+
+3. **Create S3 bucket**:
+   ```bash
+   aws --endpoint-url=http://localhost:4566 s3 mb s3://slatedb
+   ```
+
+### For AWS S3 (Production)
+
+1. **AWS Account**: Active AWS account with S3 access
+2. **IAM Credentials**: Access key ID and secret access key
+3. **S3 Bucket**: Existing bucket or permissions to create one
+4. **Region**: AWS region where your bucket is located
+
+## Configuration Options
+
+### LocalStack Configuration
+
+For local development with LocalStack:
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::new()
+        .with_allow_http(true)                      // Allow HTTP for local testing
+        .with_endpoint("http://localhost:4566")     // LocalStack endpoint
+        .with_access_key_id("test")                 // LocalStack test credentials
+        .with_secret_access_key("test")             // LocalStack test credentials
+        .with_bucket_name("slatedb")                // Your bucket name
+        .with_region("us-east-1")                   // Any region works for LocalStack
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?,
+);
+```
+
+### AWS S3 Configuration
+
+For production use with AWS S3:
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::new()
+        .with_access_key_id("YOUR_ACCESS_KEY_ID")
+        .with_secret_access_key("YOUR_SECRET_ACCESS_KEY")
+        .with_bucket_name("your-slatedb-bucket")
+        .with_region("us-east-1")                   // Your AWS region
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?,
+);
+```
+
+<Note>
+  The `with_conditional_put(S3ConditionalPut::ETagMatch)` option is required for SlateDB to ensure consistency during concurrent writes.
+</Note>
+
+### Environment Variables
+
+Alternatively, use environment variables:
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name("your-slatedb-bucket")
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?,
+);
+```
+
+Required environment variables:
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_REGION`
+- `AWS_ENDPOINT` (optional, for S3-compatible services)
+
+### MinIO Configuration
+
+For MinIO or other S3-compatible services:
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::new()
+        .with_allow_http(true)                      // Use if MinIO uses HTTP
+        .with_endpoint("http://localhost:9000")     // MinIO endpoint
+        .with_access_key_id("minioadmin")           // MinIO credentials
+        .with_secret_access_key("minioadmin")       // MinIO credentials
+        .with_bucket_name("slatedb")
+        .with_region("us-east-1")                   // Required but not used by MinIO
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?,
+);
+```
+
+## Running the Example
+
+### With LocalStack
+
+1. **Start LocalStack**:
+   ```bash
+   localstack start
+   ```
+
+2. **Create bucket**:
+   ```bash
+   aws --endpoint-url=http://localhost:4566 s3 mb s3://slatedb
+   ```
+
+3. **Run example**:
+   ```bash
+   cd examples
+   cargo run --bin s3-compatible
+   ```
+
+### With AWS S3
+
+1. **Set environment variables**:
+   ```bash
+   export AWS_ACCESS_KEY_ID="your-access-key"
+   export AWS_SECRET_ACCESS_KEY="your-secret-key"
+   export AWS_REGION="us-east-1"
+   ```
+
+2. **Update code with your bucket name**
+
+3. **Run example**:
+   ```bash
+   cd examples
+   cargo run --bin s3-compatible
+   ```
+
+## IAM Permissions
+
+For AWS S3, your IAM user or role needs the following permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-slatedb-bucket",
+        "arn:aws:s3:::your-slatedb-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+## Advanced Configuration
+
+### Custom Path Prefix
+
+Store SlateDB data under a specific prefix:
+
+```rust
+let path = "/tmp/slatedb_s3";
+let db = Db::open(path, object_store).await?;
+```
+
+Objects will be stored with the path as a prefix: `/tmp/slatedb_s3/manifest.json`, etc.
+
+### Connection Pooling
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::new()
+        .with_access_key_id("...")
+        .with_secret_access_key("...")
+        .with_bucket_name("slatedb")
+        .with_region("us-east-1")
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_timeout(std::time::Duration::from_secs(30))
+        )
+        .build()?,
+);
+```
+
+### Server-Side Encryption
+
+Enable SSE-S3 encryption:
+
+```rust
+let object_store = Arc::new(
+    object_store::aws::AmazonS3Builder::new()
+        .with_access_key_id("...")
+        .with_secret_access_key("...")
+        .with_bucket_name("slatedb")
+        .with_region("us-east-1")
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_encryption(object_store::aws::ServerSideEncryption::Aes256)
+        .build()?,
+);
+```
+
+## How It Works
+
+### Data Storage
+
+SlateDB stores data in S3 with the following structure:
+
+```
+your-bucket/
+  tmp/
+    slatedb_s3/
+      manifest.json          # Database metadata
+      compacted/
+        00001.sst            # Compacted SST files
+        00002.sst
+      wal/
+        00001.wal            # Write-ahead log files
+      checkpoints/           # Checkpoint data
+```
+
+### Write Path
+
+1. Writes go to the in-memory memtable
+2. When memtable fills, it's flushed to S3 as an SST file
+3. Manifest is updated atomically using S3 conditional puts
+4. Background compaction merges SST files
+
+### Consistency Guarantees
+
+SlateDB uses `S3ConditionalPut::ETagMatch` to ensure:
+- Atomic manifest updates
+- Protection against concurrent writers
+- Strong consistency for metadata operations
+
+<Warning>
+  Always use `with_conditional_put(S3ConditionalPut::ETagMatch)` to prevent data corruption from concurrent writes.
+</Warning>
+
+## Performance Considerations
+
+### Latency
+- S3 requests have higher latency than local storage
+- SlateDB mitigates this with caching and batching
+- Consider using AWS Transfer Acceleration for cross-region access
+
+### Cost Optimization
+- Use S3 Intelligent-Tiering for automatic cost optimization
+- Configure object lifecycle policies for old data
+- Monitor request costs (PUT/GET operations)
+
+### Throughput
+- S3 supports high throughput per prefix
+- SlateDB automatically spreads data across multiple prefixes
+- Consider using S3 Express One Zone for lowest latency
+
+## Troubleshooting
+
+### Connection Issues
+
+**Error**: "Failed to connect to S3"
+
+**Solutions**:
+- Verify endpoint URL is correct
+- Check network connectivity
+- Ensure credentials are valid
+- For LocalStack, verify it's running: `localstack status`
+
+### Permissions Issues
+
+**Error**: "Access Denied"
+
+**Solutions**:
+- Verify IAM permissions include required S3 actions
+- Check bucket policy allows your IAM principal
+- Ensure bucket exists and is in the correct region
+
+### Conditional Put Issues
+
+**Error**: "Precondition Failed"
+
+**Solutions**:
+- Ensure no other SlateDB instance is using the same path
+- Check that `S3ConditionalPut::ETagMatch` is configured
+- For S3-compatible services, verify ETag support
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Azure Blob Storage" icon="microsoft" href="/examples/azure-blob">
+    Use Azure as the backend
+  </Card>
+  <Card title="Google Cloud Storage" icon="google" href="/examples/google-cloud">
+    Integrate with GCS
+  </Card>
+  <Card title="Configuration Guide" icon="sliders" href="/guides/configuration">
+    Customize database settings
+  </Card>
+  <Card title="Performance Tuning" icon="gauge" href="/advanced/performance-tuning">
+    Optimize for your workload
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [object_store S3 documentation](https://docs.rs/object_store/latest/object_store/aws/index.html)
+- [AWS S3 API Reference](https://docs.aws.amazon.com/s3/)
+- [LocalStack S3 documentation](https://docs.localstack.cloud/user-guide/aws/s3/)
+- [MinIO documentation](https://min.io/docs/minio/linux/index.html)

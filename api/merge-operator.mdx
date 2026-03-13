@@ -1,0 +1,332 @@
+---
+title: "MergeOperator"
+description: "Custom merge operations for efficient updates without read-modify-write cycles"
+---
+
+## Overview
+
+The `MergeOperator` trait allows you to define custom merge operations that combine multiple values associatively. This is useful for:
+
+- **Counters**: Increment/decrement without reading first
+- **Aggregations**: Sum, min, max operations
+- **Append-only lists**: Buffering values
+- **Set operations**: Union, intersection
+
+Merge operators eliminate read-modify-write cycles, improving performance for concurrent updates.
+
+## Trait Definition
+
+```rust
+pub trait MergeOperator {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError>;
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError>;
+}
+```
+
+## Methods
+
+### merge
+
+Combine an existing value with a single merge operand.
+
+<ParamField path="key" type="&Bytes" required>
+  The key being merged (for context)
+</ParamField>
+
+<ParamField path="existing_value" type="Option<Bytes>" required>
+  The current value (None if key doesn't exist)
+</ParamField>
+
+<ParamField path="operand" type="Bytes" required>
+  The new value to merge
+</ParamField>
+
+<ResponseField name="result" type="Bytes">
+  The merged result
+</ResponseField>
+
+### merge_batch
+
+Combine an existing value with multiple merge operands.
+
+<ParamField path="key" type="&Bytes" required>
+  The key being merged
+</ParamField>
+
+<ParamField path="existing_value" type="Option<Bytes>" required>
+  The current value (None if key doesn't exist)
+</ParamField>
+
+<ParamField path="operands" type="&[Bytes]" required>
+  Array of operands to merge
+</ParamField>
+
+<ResponseField name="result" type="Bytes">
+  The merged result
+</ResponseField>
+
+## Associativity Requirement
+
+<Warning>
+  Your merge operation MUST be associative: `merge(merge(a, b), c) == merge(a, merge(b, c))`
+  
+  SlateDB applies merge operations in arbitrary order during compaction. Non-associative operations will produce incorrect results.
+</Warning>
+
+## Counter Example
+
+A simple counter that increments by merge operands:
+
+```rust
+use bytes::Bytes;
+use slatedb::{MergeOperator, MergeOperatorError};
+
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let increment = u64::from_le_bytes(
+            operand.as_ref().try_into().unwrap()
+        );
+        Ok(Bytes::copy_from_slice(&(existing + increment).to_le_bytes()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut total = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        for operand in operands {
+            let increment = u64::from_le_bytes(
+                operand.as_ref().try_into().unwrap()
+            );
+            total += increment;
+        }
+        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+    }
+}
+```
+
+## Using a Merge Operator
+
+Register your merge operator when building the database:
+
+```rust
+use slatedb::DbBuilder;
+use std::sync::Arc;
+
+let db = DbBuilder::new(object_store)
+    .with_merge_operator(Arc::new(CounterMergeOperator))
+    .build()
+    .await?;
+
+// Now use merge operations
+db.merge(b"page_views", &1u64.to_le_bytes()).await?;
+db.merge(b"page_views", &5u64.to_le_bytes()).await?;
+
+// Read the merged result
+let value = db.get(b"page_views").await?.unwrap();
+let count = u64::from_le_bytes(value.as_ref().try_into().unwrap());
+assert_eq!(count, 6);
+```
+
+## Advanced Examples
+
+### Append-Only List
+
+Buffer multiple values into a list:
+
+```rust
+use bytes::{Bytes, BytesMut, Buf, BufMut};
+use slatedb::{MergeOperator, MergeOperatorError};
+
+struct AppendMergeOperator;
+
+impl MergeOperator for AppendMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut result = BytesMut::new();
+        if let Some(existing) = existing_value {
+            result.put(existing);
+        }
+        // Append length-prefixed value
+        result.put_u32(operand.len() as u32);
+        result.put(operand);
+        Ok(result.freeze())
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut result = BytesMut::new();
+        if let Some(existing) = existing_value {
+            result.put(existing);
+        }
+        for operand in operands {
+            result.put_u32(operand.len() as u32);
+            result.put(operand.clone());
+        }
+        Ok(result.freeze())
+    }
+}
+
+// Usage
+db.merge(b"events", Bytes::from("event1")).await?;
+db.merge(b"events", Bytes::from("event2")).await?;
+db.merge(b"events", Bytes::from("event3")).await?;
+
+// Read and parse the list
+let value = db.get(b"events").await?.unwrap();
+let mut cursor = value.as_ref();
+let mut events = Vec::new();
+while cursor.has_remaining() {
+    let len = cursor.get_u32() as usize;
+    events.push(cursor.copy_to_bytes(len));
+}
+assert_eq!(events.len(), 3);
+```
+
+### Max Value
+
+Keep the maximum value:
+
+```rust
+struct MaxMergeOperator;
+
+impl MergeOperator for MaxMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let new_val = u64::from_le_bytes(
+            operand.as_ref().try_into().unwrap()
+        );
+        let existing_val = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        Ok(Bytes::copy_from_slice(
+            &existing_val.max(new_val).to_le_bytes()
+        ))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut max_val = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        for operand in operands {
+            let val = u64::from_le_bytes(
+                operand.as_ref().try_into().unwrap()
+            );
+            max_val = max_val.max(val);
+        }
+        Ok(Bytes::copy_from_slice(&max_val.to_le_bytes()))
+    }
+}
+```
+
+## When Merge is Called
+
+Merge operations are applied:
+
+1. **During reads**: When a `get()` encounters merge operands
+2. **During compaction**: When SSTs are merged
+3. **During flushes**: When memtables are written to SSTs
+
+<Info>
+  SlateDB may batch multiple merge operands before calling `merge_batch()` for efficiency.
+</Info>
+
+## Error Handling
+
+```rust
+use slatedb::MergeOperatorError;
+
+impl MergeOperator for MyOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        if operand.is_empty() {
+            return Err(MergeOperatorError::EmptyBatch);
+        }
+        // ... merge logic ...
+        Ok(result)
+    }
+}
+```
+
+## Performance Benefits
+
+<CardGroup cols={2}>
+  <Card title="No Read-Modify-Write" icon="gauge-high">
+    Merge operations don't require reading the current value, reducing latency
+  </Card>
+  <Card title="High Concurrency" icon="users">
+    Multiple writers can merge concurrently without conflicts
+  </Card>
+  <Card title="Efficient Compaction" icon="layer-group">
+    Merge operands are combined during compaction, reducing space
+  </Card>
+  <Card title="Reduced Contention" icon="lock-open">
+    No write-write conflicts on the same key
+  </Card>
+</CardGroup>
+
+## Best Practices
+
+<Tip>
+  Implement `merge_batch()` efficiently - it's called during compaction to combine many operands at once.
+</Tip>
+
+<Warning>
+  Test your merge operator thoroughly to ensure associativity. Use property-based testing if possible.
+</Warning>
+
+<Note>
+  Merge operations are permanent. Unlike transactions, they cannot be rolled back once committed.
+</Note>
+
+## See Also
+
+- [Merge Operators Guide](/guides/merge-operators) - Comprehensive guide with examples
+- [Db::merge](/api/db#merge) - Applying merge operations
+- [Configuration](/guides/configuration) - Registering merge operators

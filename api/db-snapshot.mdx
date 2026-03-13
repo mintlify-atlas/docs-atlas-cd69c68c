@@ -1,0 +1,485 @@
+---
+title: 'DbSnapshot'
+description: 'Point-in-time snapshot for consistent reads'
+---
+
+## Overview
+
+The `DbSnapshot` provides a point-in-time view of the database, allowing you to read data as it existed at the moment the snapshot was created. Any writes that occur after the snapshot is created will not be visible through the snapshot.
+
+Snapshots are useful for:
+- Consistent reads across multiple operations
+- Reading data without being affected by concurrent writes
+- Implementing read-only transactions
+- Point-in-time data analysis
+
+## Creating a Snapshot
+
+Snapshots are created from a `Db` instance:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Write some data
+    db.put(b"key1", b"value1").await?;
+    
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    
+    // Writes after snapshot creation won't be visible to the snapshot
+    db.put(b"key2", b"value2").await?;
+    
+    // Snapshot only sees key1
+    assert_eq!(snapshot.get(b"key1").await?, Some(bytes::Bytes::from("value1")));
+    assert_eq!(snapshot.get(b"key2").await?, None);
+    
+    // But the main db sees both
+    assert_eq!(db.get(b"key2").await?, Some(bytes::Bytes::from("value2")));
+    
+    Ok(())
+}
+```
+
+## Internal Structure
+
+```rust
+pub struct DbSnapshot {
+    txn_id: Uuid,
+    started_seq: u64,
+    txn_manager: Arc<TransactionManager>,
+    db_inner: Arc<DbInner>,
+}
+```
+
+<ParamField path="txn_id" type="Uuid">
+  Internal transaction ID for this snapshot
+</ParamField>
+
+<ParamField path="started_seq" type="u64">
+  The sequence number when the snapshot was created. The snapshot will only see writes with sequence numbers less than or equal to this value.
+</ParamField>
+
+<ParamField path="txn_manager" type="Arc<TransactionManager>">
+  Reference to the transaction manager
+</ParamField>
+
+<ParamField path="db_inner" type="Arc<DbInner>">
+  Reference to the database internals
+</ParamField>
+
+## Read Operations
+
+`DbSnapshot` implements the `DbRead` trait, providing all standard read methods:
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the snapshot with default read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  - `Ok(Some(Bytes))` - The value if it existed at snapshot time
+  - `Ok(None)` - If the key did not exist at snapshot time
+  - `Err(Error)` - If there was an error reading
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key", b"original").await?;
+    let snapshot = db.snapshot().await?;
+    
+    // Modify after snapshot
+    db.put(b"key", b"modified").await?;
+    
+    // Snapshot sees original value
+    assert_eq!(snapshot.get(b"key").await?, Some(bytes::Bytes::from("original")));
+    
+    // DB sees modified value
+    assert_eq!(db.get(b"key").await?, Some(bytes::Bytes::from("modified")));
+    
+    Ok(())
+}
+```
+
+---
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the snapshot with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to control the behavior
+</ParamField>
+
+---
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the snapshot with default read options.
+
+Returns metadata along with the value including sequence number, creation timestamp, and expiration timestamp.
+
+---
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair from the snapshot with custom read options.
+
+---
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys using the default scan options.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  An iterator over the snapshot's view of the range
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    
+    let snapshot = db.snapshot().await?;
+    
+    // Add more data after snapshot
+    db.put(b"key3", b"value3").await?;
+    db.delete(b"key1").await?;
+    
+    // Snapshot scan sees original state
+    let mut iter = snapshot.scan(..).await?;
+    let kv1 = iter.next().await?.unwrap();
+    assert_eq!(kv1.key.as_ref(), b"key1");
+    let kv2 = iter.next().await?.unwrap();
+    assert_eq!(kv2.key.as_ref(), b"key2");
+    assert_eq!(None, iter.next().await?);
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+Scan a range of keys with custom scan options.
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to control the behavior
+</ParamField>
+
+---
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix using the default scan options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"user:1:name", b"Alice").await?;
+    db.put(b"user:1:email", b"alice@example.com").await?;
+    
+    let snapshot = db.snapshot().await?;
+    
+    db.put(b"user:2:name", b"Bob").await?;
+    
+    // Snapshot only sees user:1 data
+    let mut iter = snapshot.scan_prefix(b"user:1:").await?;
+    assert_eq!(iter.next().await?.unwrap().key.as_ref(), b"user:1:email");
+    assert_eq!(iter.next().await?.unwrap().key.as_ref(), b"user:1:name");
+    assert_eq!(None, iter.next().await?);
+    
+    Ok(())
+}
+```
+
+---
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+Scan all keys that share the provided prefix with custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to control the behavior
+</ParamField>
+
+## Snapshot Isolation
+
+Snapshots provide **Snapshot Isolation** guarantees:
+
+1. **Consistent Point-in-Time View**: A snapshot sees the database as it existed at the moment of creation
+2. **Immunity to Concurrent Writes**: Writes that occur after snapshot creation are not visible
+3. **See Own Uncommitted Writes**: If created within a transaction, sees that transaction's writes
+
+### Example: Isolation from Concurrent Writes
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Initial state
+    db.put(b"counter", b"1").await?;
+    
+    let snapshot = db.snapshot().await?;
+    
+    // Multiple writes after snapshot
+    db.put(b"counter", b"2").await?;
+    db.flush().await?;
+    db.put(b"counter", b"3").await?;
+    db.flush().await?;
+    
+    // Snapshot still sees original value
+    assert_eq!(
+        snapshot.get(b"counter").await?,
+        Some(bytes::Bytes::from("1"))
+    );
+    
+    // DB sees latest value
+    assert_eq!(
+        db.get(b"counter").await?,
+        Some(bytes::Bytes::from("3"))
+    );
+    
+    Ok(())
+}
+```
+
+### Example: Multiple Snapshots
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    // Version 1
+    db.put(b"key", b"version1").await?;
+    let snapshot1 = db.snapshot().await?;
+    
+    // Version 2
+    db.put(b"key", b"version2").await?;
+    let snapshot2 = db.snapshot().await?;
+    
+    // Version 3
+    db.put(b"key", b"version3").await?;
+    let snapshot3 = db.snapshot().await?;
+    
+    // Each snapshot sees its respective version
+    assert_eq!(
+        snapshot1.get(b"key").await?,
+        Some(bytes::Bytes::from("version1"))
+    );
+    assert_eq!(
+        snapshot2.get(b"key").await?,
+        Some(bytes::Bytes::from("version2"))
+    );
+    assert_eq!(
+        snapshot3.get(b"key").await?,
+        Some(bytes::Bytes::from("version3"))
+    );
+    
+    Ok(())
+}
+```
+
+## Lifecycle Management
+
+Snapshots are automatically cleaned up when dropped:
+
+```rust
+impl Drop for DbSnapshot {
+    fn drop(&mut self) {
+        self.txn_manager.drop_txn(&self.txn_id);
+    }
+}
+```
+
+The snapshot unregisters itself from the transaction manager when it goes out of scope, allowing the database to reclaim resources.
+
+**Example:**
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    
+    {
+        let snapshot = db.snapshot().await?;
+        // Use snapshot...
+        assert_eq!(snapshot.get(b"key").await?, Some(bytes::Bytes::from("value")));
+    } // snapshot is dropped here, resources are cleaned up
+    
+    // Can create new snapshots
+    let snapshot2 = db.snapshot().await?;
+    
+    Ok(())
+}
+```
+
+## Usage Notes
+
+<Note>
+  Snapshots capture the database state based on the sequence number at creation time. They see all committed writes up to that sequence number.
+</Note>
+
+<Warning>
+  Long-lived snapshots can prevent the database from reclaiming old versions of data. Create snapshots only when needed and drop them promptly when done.
+</Warning>
+
+<Info>
+  Unlike checkpoints (used by `DbReader`), snapshots are lightweight in-memory constructs that don't persist to object storage.
+</Info>
+
+## Comparison with DbReader
+
+| Feature | DbSnapshot | DbReader |
+|---------|-----------|----------|
+| Creation | From `Db::snapshot()` | From `DbReader::open()` |
+| Persistence | In-memory only | Reads from persistent checkpoints |
+| Use Case | Short-lived consistent reads | Long-lived read-only access |
+| Resource Cost | Lightweight | Heavier (manages checkpoints) |
+| Isolation | Snapshot isolation | Committed state only |
+| Lifecycle | Automatic cleanup on drop | Manual `close()` required |
+
+## Related
+
+- [DbRead Trait](/api/db-read) - Common read operations
+- [DbReader](/api/db-reader) - Read-only database access
+- [DbIterator](/api/db-iterator) - Iterator for scan results

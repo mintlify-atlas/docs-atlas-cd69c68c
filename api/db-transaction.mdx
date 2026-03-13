@@ -1,0 +1,255 @@
+---
+title: "DbTransaction"
+description: "Database transaction API for atomic read-write operations with configurable isolation levels"
+---
+
+## Overview
+
+`DbTransaction` provides atomic read-write operations with configurable isolation levels. Transactions in SlateDB support both Snapshot Isolation and Serializable Snapshot Isolation, providing ACID guarantees for concurrent access.
+
+## Creating Transactions
+
+### begin
+
+Create a new transaction with the specified isolation level.
+
+<ParamField path="isolation_level" type="IsolationLevel" required>
+  The isolation level for the transaction (Snapshot or SerializableSnapshot)
+</ParamField>
+
+```rust
+use slatedb::{Db, IsolationLevel};
+
+let db = Db::open("/tmp/db", object_store).await?;
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+```
+
+## Read Operations
+
+Transactions implement the `DbRead` trait, providing all standard read operations:
+
+### get
+
+Read a value within the transaction's snapshot.
+
+<ParamField path="key" type="&[u8]" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="value" type="Option<Bytes>">
+  The value if it exists, None otherwise
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let value = txn.get(b"key").await?;
+```
+
+### scan
+
+Scan a range of keys within the transaction's snapshot.
+
+<ParamField path="range" type="impl RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="iterator" type="DbIterator">
+  An iterator over the key-value pairs in the range
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let mut iter = txn.scan(b"a"..=b"z").await?;
+while let Some(kv) = iter.next().await? {
+    println!("{:?} = {:?}", kv.key, kv.value);
+}
+```
+
+## Write Operations
+
+Write operations in a transaction are buffered and only become visible to other transactions after commit.
+
+### put
+
+Write a key-value pair to the transaction.
+
+<ParamField path="key" type="&[u8]" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="&[u8]" required>
+  The value to write
+</ParamField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+```
+
+<Note>
+  Writes within a transaction are immediately visible to subsequent reads in the same transaction.
+</Note>
+
+### delete
+
+Delete a key from the transaction.
+
+<ParamField path="key" type="&[u8]" required>
+  The key to delete
+</ParamField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.delete(b"key")?;
+```
+
+### merge
+
+Apply a merge operation within the transaction.
+
+<ParamField path="key" type="&[u8]" required>
+  The key to merge
+</ParamField>
+
+<ParamField path="operand" type="&[u8]" required>
+  The merge operand to apply
+</ParamField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.merge(b"counter", &1u64.to_le_bytes())?;
+```
+
+## Committing and Rolling Back
+
+### commit
+
+Commit the transaction, making all writes durable and visible to other transactions.
+
+<ResponseField name="handle" type="WriteHandle">
+  A handle containing the commit timestamp and sequence number
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+let handle = txn.commit().await?;
+println!("Committed at seq: {}", handle.seqnum());
+```
+
+<Warning>
+  If the transaction encounters a conflict during commit, it will return a `TransactionConflict` error. The transaction cannot be retried and must be recreated.
+</Warning>
+
+### rollback
+
+Rollback the transaction, discarding all buffered writes.
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+txn.rollback(); // Discard changes
+```
+
+<Note>
+  Transactions are automatically rolled back when dropped without calling commit.
+</Note>
+
+## Conflict Detection
+
+SlateDB detects conflicts based on the isolation level:
+
+### Snapshot Isolation
+
+- Detects **write-write conflicts**: two transactions writing to the same key
+- Does not detect read-write conflicts (phantom reads are possible)
+- Provides good performance for most workloads
+
+```rust
+// Transaction 1
+let txn1 = db.begin(IsolationLevel::Snapshot).await?;
+txn1.put(b"key", b"value1")?;
+
+// Transaction 2 (started after txn1, before it commits)
+let txn2 = db.begin(IsolationLevel::Snapshot).await?;
+txn2.put(b"key", b"value2")?;
+
+// One of these commits will succeed, the other will fail with TransactionConflict
+txn1.commit().await?;
+txn2.commit().await?; // Error: TransactionConflict
+```
+
+### Serializable Snapshot Isolation
+
+- Detects both **read-write** and **write-write conflicts**
+- Prevents phantom reads by tracking read ranges
+- Provides true serializability but with higher overhead
+
+```rust
+// Transaction 1 reads a range
+let txn1 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let mut iter = txn1.scan(b"a"..=b"z").await?;
+while let Some(_) = iter.next().await? {}
+
+// Transaction 2 writes within that range
+let txn2 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+txn2.put(b"m", b"new")?;
+txn2.commit().await?;
+
+// txn1 commit will fail due to read-write conflict
+txn1.commit().await?; // Error: TransactionConflict
+```
+
+## Advanced Features
+
+### Untracked Writes
+
+Mark specific keys to exclude from conflict detection:
+
+```rust
+txn.untrack_write_key(b"metadata")?;
+txn.put(b"metadata", b"internal")?; // Won't cause conflicts
+```
+
+### Transaction ID
+
+Get the unique transaction ID:
+
+```rust
+let txn_id = txn.txn_id();
+println!("Transaction ID: {}", txn_id);
+```
+
+## Error Handling
+
+```rust
+use slatedb::{Error, ErrorKind};
+
+match txn.commit().await {
+    Ok(handle) => println!("Committed successfully"),
+    Err(Error { kind: ErrorKind::Transaction, .. }) => {
+        println!("Transaction conflict - retry needed");
+    }
+    Err(e) => println!("Other error: {}", e),
+}
+```
+
+## Best Practices
+
+<Tip>
+  Keep transactions short-lived to minimize contention and reduce the chance of conflicts.
+</Tip>
+
+<Tip>
+  Use Snapshot Isolation (the default) unless you need true serializability. It provides better performance with fewer conflicts.
+</Tip>
+
+<Warning>
+  Reading your own writes within a transaction is supported, but reads are slower than normal database reads because they must check the transaction's write buffer.
+</Warning>
+
+## See Also
+
+- [IsolationLevel](/api/isolation-level) - Transaction isolation level configuration
+- [Transactions Guide](/guides/transactions) - Comprehensive guide to using transactions
+- [Error](/api/error) - Error handling in SlateDB

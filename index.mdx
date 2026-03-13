@@ -1,97 +1,127 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "SlateDB - Cloud Native Embedded Storage Engine"
+description: "A cloud native embedded storage engine built as a log-structured merge-tree on object storage"
 ---
 
-## Setting up
+<img
+  className="block"
+  src="https://github.com/slatedb/slatedb/blob/main/website/public/img/slatedb-gh-banner.png?raw=true"
+  alt="SlateDB"
+/>
 
-Get your documentation site up and running in minutes.
+## What is SlateDB?
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+SlateDB is an embedded storage engine built as a log-structured merge-tree (LSM-tree) that writes data directly to object storage like S3, GCS, Azure Blob Storage, and MinIO. Unlike traditional LSM-tree storage engines that use local disk, SlateDB leverages object storage to provide bottomless capacity, high durability, and easy replication.
 
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Zero-Disk Architecture" icon="hard-drive">
+    Run without local disks. Object storage is the source of truth with multi-tier caching for performance.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="ACID Transactions" icon="shield-check">
+    Full transaction support with snapshot isolation and configurable durability guarantees.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="LSM-Tree Storage" icon="database">
+    Proven storage architecture optimized for cloud object storage with efficient compaction strategies.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Multi-Language Support" icon="code">
+    Official bindings for Rust, Python, Java, and Go. Community bindings for .NET, Ruby, and TypeScript.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key Features
 
-Everything you need to create world-class documentation.
+<AccordionGroup>
+  <Accordion title="Cloud Native Design">
+    SlateDB is built from the ground up for object storage. It batches writes to reduce API costs, uses bloom filters and caching to optimize reads, and supports pluggable compaction that can run as a separate process.
+  </Accordion>
+  
+  <Accordion title="Performance Optimized">
+    Multi-tier caching (block cache, disk cache), compression (snappy, zlib, lz4, zstd), bloom filters, and configurable durability options to balance latency with persistence guarantees.
+  </Accordion>
+  
+  <Accordion title="Advanced Features">
+    Range queries, snapshots, checkpoints, merge operators, change data capture (CDC), and support for custom compaction filters and strategies.
+  </Accordion>
+  
+  <Accordion title="Production Ready">
+    Used by companies including Embucket, Gadget, Malstrom, Massive, Merklemap, Responsive, SQLync, and many more. Apache 2.0 licensed and part of the Commonhaus Foundation.
+  </Accordion>
+</AccordionGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Quick Example
 
-## Need inspiration?
+Get started with SlateDB in minutes:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Open database with in-memory object store
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/my_db", object_store).await?;
+
+    // Write data
+    db.put(b"hello", b"world").await?;
+
+    // Read data
+    let value = db.get(b"hello").await?;
+    assert_eq!(value, Some("world".into()));
+
+    // Range queries
+    let mut iter = db.scan(b"a"..=b"z").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("{:?} = {:?}", kv.key, kv.value);
+    }
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add SlateDB to your project in Rust, Python, Java, or Go
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first SlateDB application in under 5 minutes
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Learn how SlateDB works and why it's built for object storage
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/db">
+    Explore the complete API documentation
+  </Card>
+</CardGroup>
+
+## Why Object Storage?
+
+Object storage provides several advantages for cloud-native applications:
+
+- **Bottomless Capacity**: Scale storage independently without provisioning disks
+- **High Durability**: Built-in replication across availability zones
+- **Easy Replication**: Clone databases across regions with object storage replication
+- **Cost Effective**: Pay only for what you store with automatic tiering
+
+SlateDB mitigates object storage's higher latency and API costs through batching, caching, and compression.
+
+## Community & Support
+
+<CardGroup cols={2}>
+  <Card title="GitHub Discussions" icon="github" href="https://github.com/slatedb/slatedb/discussions">
+    Ask questions and share ideas with the community
+  </Card>
+  <Card title="Discord" icon="discord" href="https://discord.gg/mHYmGy5MgA">
+    Join our Discord server for real-time chat
+  </Card>
+  <Card title="Contributing" icon="code-pull-request" href="https://github.com/slatedb/slatedb/blob/main/CONTRIBUTING.md">
+    Learn how to contribute to SlateDB
+  </Card>
+  <Card title="Clean Slate Philosophy" icon="scroll" href="/advanced/clean-slate">
+    Understand SlateDB's design principles and values
+  </Card>
+</CardGroup>

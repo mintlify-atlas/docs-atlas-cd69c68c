@@ -1,0 +1,365 @@
+---
+title: "DbBuilder"
+description: "Advanced configuration builder for SlateDB databases"
+---
+
+The `DbBuilder` provides a fluent API for configuring and opening SlateDB databases with custom settings and components.
+
+## Creating a Builder
+
+### `Db::builder`
+
+```rust
+pub fn builder<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> DbBuilder<P>
+```
+
+Creates a new database builder.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  Path to the database in the object store
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  Main object store for data persistence
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  A builder instance for configuring the database
+</ResponseField>
+
+## Configuration Methods
+
+### `with_settings`
+
+```rust
+pub fn with_settings(self, settings: Settings) -> Self
+```
+
+Sets database settings (cache sizes, SST sizes, flush intervals, etc.).
+
+<ParamField path="settings" type="Settings" required>
+  Database settings to apply
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::{Db, config::Settings};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_settings(Settings {
+            l0_sst_size_bytes: 64 * 1024 * 1024, // 64 MB L0 SSTs
+            min_filter_keys: 2000,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### `with_wal_object_store`
+
+```rust
+pub fn with_wal_object_store(self, wal_object_store: Arc<dyn ObjectStore>) -> Self
+```
+
+Sets a separate object store for the Write-Ahead Log (WAL).
+
+<ParamField path="wal_object_store" type="Arc<dyn ObjectStore>" required>
+  Dedicated object store for WAL files
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Note:** WAL durability and availability depend on the underlying object store properties. Ensure the configured store meets your requirements.
+
+### `with_db_cache`
+
+```rust
+pub fn with_db_cache(self, db_cache: Arc<dyn DbCache>) -> Self
+```
+
+Sets a custom cache implementation for SST blocks and metadata.
+
+<ParamField path="db_cache" type="Arc<dyn DbCache>" required>
+  Custom cache implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::{Db, db_cache::foyer::FoyerCache};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let cache = Arc::new(FoyerCache::new());
+    let db = Db::builder("my_db", object_store)
+        .with_db_cache(cache)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### `with_db_cache_disabled`
+
+```rust
+pub fn with_db_cache_disabled(self) -> Self
+```
+
+Disables the SST block and metadata cache.
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### `with_system_clock`
+
+```rust
+pub fn with_system_clock(self, clock: Arc<dyn SystemClock>) -> Self
+```
+
+Sets a custom system clock for timestamps and scheduling.
+
+<ParamField path="clock" type="Arc<dyn SystemClock>" required>
+  System clock implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### `with_gc_runtime`
+
+```rust
+pub fn with_gc_runtime(self, gc_runtime: Handle) -> Self
+```
+
+Sets the Tokio runtime for garbage collection tasks.
+
+<ParamField path="gc_runtime" type="Handle" required>
+  Tokio runtime handle
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### `with_compactor_builder`
+
+```rust
+pub fn with_compactor_builder(self, compactor_builder: CompactorBuilder<P>) -> Self
+```
+
+Sets a custom compactor builder for advanced compaction control.
+
+<ParamField path="compactor_builder" type="CompactorBuilder<P>" required>
+  Custom compactor builder
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Note:** Setting a `CompactorBuilder` overrides any `compactor_options` in `Settings`.
+
+### `with_seed`
+
+```rust
+pub fn with_seed(self, seed: u64) -> Self
+```
+
+Sets a seed for the database's random number generator.
+
+<ParamField path="seed" type="u64" required>
+  Random seed for reproducible behavior (testing)
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Note:** This controls all random behavior including UUIDs, ULIDs, and cache eviction.
+
+### `with_sst_block_size`
+
+```rust
+pub fn with_sst_block_size(self, block_size: SstBlockSize) -> Self
+```
+
+Sets the block size for SSTable blocks.
+
+<ParamField path="block_size" type="SstBlockSize" required>
+  Block size variant (1KB, 2KB, 4KB, 8KB, 16KB, 32KB, or 64KB)
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::{Db, config::SstBlockSize};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_sst_block_size(SstBlockSize::Block8Kib) // 8 KiB blocks
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+**Note:** Blocks are the unit of reading and caching. Smaller blocks reduce read amplification but increase metadata overhead. Larger blocks are better for sequential scans but may waste bandwidth for point lookups. When compression is enabled, larger blocks typically achieve better compression ratios.
+
+### `with_merge_operator`
+
+```rust
+pub fn with_merge_operator(self, merge_operator: MergeOperatorType) -> Self
+```
+
+Sets a merge operator for the database.
+
+<ParamField path="merge_operator" type="MergeOperatorType" required>
+  Arc-wrapped merge operator implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::{Db, MergeOperator, MergeOperatorError};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+use bytes::Bytes;
+
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap()))
+            .unwrap_or(0);
+        let delta = u64::from_le_bytes(operand[..8].try_into().unwrap());
+        Ok(Bytes::from((existing + delta).to_le_bytes().to_vec()))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_merge_operator(Arc::new(CounterMergeOperator))
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### `with_block_transformer`
+
+```rust
+pub fn with_block_transformer(self, block_transformer: Arc<dyn BlockTransformer>) -> Self
+```
+
+Sets a block transformer for custom encoding (e.g., encryption).
+
+<ParamField path="block_transformer" type="Arc<dyn BlockTransformer>" required>
+  Block transformer implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+**Note:** The transformer is applied after compression on write and before decompression on read. Checksums are calculated on the transformed data.
+
+### `with_fp_registry`
+
+```rust
+pub fn with_fp_registry(self, fp_registry: Arc<FailPointRegistry>) -> Self
+```
+
+Sets a failpoint registry for testing fault injection.
+
+<ParamField path="fp_registry" type="Arc<FailPointRegistry>" required>
+  Failpoint registry
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+## Building the Database
+
+### `build`
+
+```rust
+pub async fn build(self) -> Result<Db, Error>
+```
+
+Builds and opens the database with the configured settings.
+
+<ResponseField name="Result" type="Result<Db, Error>">
+  Returns the opened database instance or an error
+</ResponseField>
+
+**Example**
+
+```rust
+use slatedb::{Db, config::Settings};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_settings(Settings {
+            l0_sst_size_bytes: 32 * 1024 * 1024,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    
+    // Use the database
+    db.put(b"key", b"value").await?;
+    
+    Ok(())
+}
+```

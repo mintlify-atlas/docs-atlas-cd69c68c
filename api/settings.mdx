@@ -1,0 +1,505 @@
+---
+title: Settings
+description: Configuration options for SlateDB
+---
+
+The `Settings` struct represents the configuration options that control SlateDB's behavior. You can customize the database engine to your use case by adjusting these settings.
+
+## Loading Configuration
+
+SlateDB supports multiple ways to load configuration:
+
+### From Default Values
+
+```rust
+use slatedb::config::Settings;
+
+let config = Settings::default();
+```
+
+### From a Configuration File
+
+SlateDB supports TOML, JSON, and YAML formats:
+
+```rust
+use slatedb::config::Settings;
+
+let config = Settings::from_file("config.toml")?;
+```
+
+### From Environment Variables
+
+Load settings from environment variables with a prefix:
+
+```rust
+use slatedb::config::Settings;
+
+let config = Settings::from_env("SLATEDB_")?;
+```
+
+### From Multiple Sources
+
+Load from predefined files and environment variables:
+
+```rust
+use slatedb::config::Settings;
+
+let config = Settings::load()?;
+```
+
+This method merges configuration from:
+1. Default options
+2. `SlateDb.json`
+3. `SlateDb.toml`
+4. `SlateDb.yaml` or `SlateDb.yml`
+5. Environment variables prefixed with `SLATEDB_`
+
+## Core Settings
+
+### flush_interval
+
+**Type:** `Option<Duration>`  
+**Default:** `Some(100ms)`
+
+How frequently to flush the write-ahead log to object storage.
+
+**Considerations:**
+- **Latency**: Higher flush intervals increase write latency for blocking `put` calls
+- **API cost**: Lower flush intervals result in more PUT calls to object storage
+- Set to `None` to disable automatic flushing (manual flush required)
+
+**Example:**
+```toml
+flush_interval = "100ms"
+```
+
+**Recommendation:** A 100ms flush interval results in approximately $130/month in PUT costs on S3 standard.
+
+### wal_enabled
+
+**Type:** `bool`  
+**Default:** `true`  
+**Feature:** Requires `wal_disable` feature flag
+
+When set to false, SlateDB disables the WAL and writes directly into the memtable.
+
+### manifest_poll_interval
+
+**Type:** `Duration`  
+**Default:** `1s`
+
+How frequently to poll for new manifest files. Refreshing the manifest allows the database to detect fencing operations and newly compacted data.
+
+```toml
+manifest_poll_interval = "1s"
+```
+
+### manifest_update_timeout
+
+**Type:** `Duration`  
+**Default:** `300s` (5 minutes)
+
+The maximum amount of time to wait for a manifest update before giving up.
+
+```toml
+manifest_update_timeout = "300s"
+```
+
+### min_filter_keys
+
+**Type:** `u32`  
+**Default:** `1000`
+
+Write SSTables with a bloom filter if the number of keys in the SSTable is greater than or equal to this value. Reads on small SSTables might be faster without a bloom filter.
+
+```toml
+min_filter_keys = 1000
+```
+
+### filter_bits_per_key
+
+**Type:** `u32`  
+**Default:** `10`
+
+The number of bits to use per key for bloom filters. The default value of 10 yields a filter with a false positive probability of ~0.82%.
+
+**Note:** This is evaluated per-sorted-run, so the expected number of false positives per request is `fpp * number of sorted runs`. For large databases with many runs, consider setting this higher if you have sufficient memory.
+
+```toml
+filter_bits_per_key = 10
+```
+
+### l0_sst_size_bytes
+
+**Type:** `usize`  
+**Default:** `67108864` (64 MiB)
+
+The minimum size a memtable needs to be before it is frozen and flushed to L0 object storage.
+
+**Considerations:**
+- **Recovery time**: Larger sizes mean less frequent writes, resulting in more recovery data in the WAL
+- **Number of L0 SSTs/SRs**: Smaller sizes create more SSTs and Sorted Runs, potentially slowing reads
+- **Memory usage**: Larger sizes allow larger in-memory memtables to grow
+- **API cost**: Smaller sizes result in more frequent writes to object storage
+- **Secondary reader latency**: Secondary readers only see L0+ writes; higher sizes increase their latency
+
+```toml
+l0_sst_size_bytes = 67108864
+```
+
+### l0_max_ssts
+
+**Type:** `usize`  
+**Default:** `8`
+
+The maximum number of SSTs in L0. Memtables will not be flushed if there are more L0 SSTs than this value, until compaction can compact them.
+
+```toml
+l0_max_ssts = 8
+```
+
+### max_unflushed_bytes
+
+**Type:** `usize`  
+**Default:** `1073741824` (1 GiB)
+
+The maximum number of unflushed key/value pair bytes that should reside in memory before applying backpressure to writers. This includes key/value pairs in both the immutable WAL flush queue and the immutable memtable flush queue.
+
+**Writes will be paused** if the total number of unflushed bytes exceeds this value until data is flushed to object storage.
+
+```toml
+max_unflushed_bytes = 536870912
+```
+
+### compression_codec
+
+**Type:** `Option<CompressionCodec>`  
+**Default:** `None`
+
+The compression algorithm to use for SSTables. Available options (require feature flags):
+- `Snappy` (requires `snappy` feature)
+- `Zlib` (requires `zlib` feature)
+- `Lz4` (requires `lz4` feature)
+- `Zstd` (requires `zstd` feature)
+
+```toml
+compression_codec = "snappy"
+```
+
+### default_ttl
+
+**Type:** `Option<u64>`  
+**Default:** `None`
+
+The default time-to-live (TTL) for insertions in milliseconds. When set, keys will automatically expire after this duration. Re-inserting a key updates the TTL.
+
+```toml
+default_ttl = 86400000  # 24 hours in milliseconds
+```
+
+## Compactor Options
+
+**Type:** `Option<CompactorOptions>`  
+**Default:** See below
+
+Configuration options for the compactor.
+
+```toml
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+max_concurrent_compactions = 4
+manifest_update_timeout = "300s"
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+```
+
+### poll_interval
+
+**Type:** `Duration`  
+**Default:** `5s`
+
+The interval at which the compactor checks for a new manifest and decides if a compaction must be scheduled.
+
+### max_sst_size
+
+**Type:** `usize`  
+**Default:** `268435456` (256 MiB)
+
+A compacted SSTable's maximum size in bytes. If more data needs to be written to a Sorted Run during compaction, a new SSTable will be created when this size is exceeded.
+
+### max_concurrent_compactions
+
+**Type:** `usize`  
+**Default:** `4`
+
+The maximum number of concurrent compactions to execute at once.
+
+### manifest_update_timeout
+
+**Type:** `Duration`  
+**Default:** `300s` (5 minutes)
+
+Timeout to limit how long manifest updates are retried before giving up.
+
+### scheduler_options
+
+**Type:** `HashMap<String, String>`  
+**Default:** See size-tiered options
+
+Scheduler-specific options expressed as string key/value pairs. For the size-tiered compaction scheduler:
+
+- `min_compaction_sources` (default: `4`): Minimum number of sources to include in a compaction
+- `max_compaction_sources` (default: `8`): Maximum number of sources to include in a compaction
+- `include_size_threshold` (default: `4.0`): Size threshold multiplier for including sorted runs in compaction
+
+## Object Store Cache Options
+
+**Type:** `ObjectStoreCacheOptions`  
+**Default:** Cache disabled unless `root_folder` is set
+
+Configuration for the local disk cache that stores object store data.
+
+```toml
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+cache_puts = false
+scan_interval = "3600s"
+```
+
+### root_folder
+
+**Type:** `Option<PathBuf>`  
+**Default:** `None`
+
+The root folder where cache files are stored. If not set, the cache will be disabled.
+
+### max_cache_size_bytes
+
+**Type:** `Option<usize>`  
+**Default:** `17179869184` (16 GiB on 64-bit systems, 4 GiB on 32-bit systems)
+
+The limit of the cache size in bytes.
+
+### part_size_bytes
+
+**Type:** `usize`  
+**Default:** `4194304` (4 MiB)
+
+The size of each part file. The part size is expected to be aligned with 1KB.
+
+### cache_puts
+
+**Type:** `bool`  
+**Default:** `false`
+
+Whether to cache PUT operations to disk. When enabled, data written via PUT operations will be cached locally for faster subsequent reads.
+
+### preload_disk_cache_on_startup
+
+**Type:** `Option<PreloadLevel>`  
+**Default:** `None`
+
+Whether to preload SST files into cache during database startup. Options:
+- `L0Sst`: Preload only L0 SSTs (most recently written files)
+- `AllSst`: Preload all SSTs (both L0 and compacted levels)
+
+```toml
+preload_disk_cache_on_startup = "L0Sst"
+```
+
+### scan_interval
+
+**Type:** `Option<Duration>`  
+**Default:** `Some(3600s)` (1 hour)
+
+Interval to scan the cache directory to rebuild the in-memory map for the evictor. If set to `None`, the cache directory will only be scanned once on startup.
+
+## Garbage Collector Options
+
+**Type:** `Option<GarbageCollectorOptions>`  
+**Default:** Enabled for all directories
+
+Configuration options for the garbage collector.
+
+```toml
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.wal_options]
+interval = "60s"
+min_age = "60s"
+
+[garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+Each directory option (`manifest_options`, `wal_options`, `compacted_options`, `compactions_options`) has:
+
+### interval
+
+**Type:** `Option<Duration>`  
+**Default:** Varies by directory type
+
+The interval at which the garbage collector runs. If set to `None`, recurring garbage collection is disabled (but can be triggered manually).
+
+### min_age
+
+**Type:** `Duration`  
+**Default:** Varies by directory type
+
+The minimum age of a file before it can be garbage collected.
+
+## Example Configuration
+
+### TOML
+
+```toml
+flush_interval = "100ms"
+wal_enabled = false
+manifest_poll_interval = "1s"
+manifest_update_timeout = "300s"
+min_filter_keys = 1000
+filter_bits_per_key = 10
+l0_sst_size_bytes = 67108864
+l0_max_ssts = 8
+max_unflushed_bytes = 536870912
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+max_concurrent_compactions = 4
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+scan_interval = "3600s"
+
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.wal_options]
+interval = "60s"
+min_age = "60s"
+
+[garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+### JSON
+
+```json
+{
+  "flush_interval": "100ms",
+  "wal_enabled": false,
+  "manifest_poll_interval": "1s",
+  "manifest_update_timeout": "300s",
+  "min_filter_keys": 1000,
+  "filter_bits_per_key": 10,
+  "l0_sst_size_bytes": 67108864,
+  "l0_max_ssts": 8,
+  "max_unflushed_bytes": 536870912,
+  "compactor_options": {
+    "poll_interval": "5s",
+    "max_sst_size": 1073741824,
+    "max_concurrent_compactions": 4,
+    "scheduler_options": {
+      "min_compaction_sources": "4",
+      "max_compaction_sources": "8",
+      "include_size_threshold": "4.0"
+    }
+  },
+  "object_store_cache_options": {
+    "root_folder": "/tmp/slatedb-cache",
+    "max_cache_size_bytes": 17179869184,
+    "part_size_bytes": 4194304,
+    "scan_interval": "3600s"
+  },
+  "garbage_collector_options": {
+    "manifest_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "wal_options": {
+      "interval": "60s",
+      "min_age": "60s"
+    },
+    "compacted_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "compactions_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    }
+  }
+}
+```
+
+### YAML
+
+```yaml
+flush_interval: '100ms'
+wal_enabled: false
+manifest_poll_interval: '1s'
+manifest_update_timeout: '300s'
+min_filter_keys: 1000
+filter_bits_per_key: 10
+l0_sst_size_bytes: 67108864
+l0_max_ssts: 8
+max_unflushed_bytes: 536870912
+compactor_options:
+  poll_interval: '5s'
+  max_sst_size: 1073741824
+  max_concurrent_compactions: 4
+  scheduler_options:
+    min_compaction_sources: "4"
+    max_compaction_sources: "8"
+    include_size_threshold: "4.0"
+object_store_cache_options:
+  root_folder: /tmp/slatedb-cache
+  max_cache_size_bytes: 17179869184
+  part_size_bytes: 4194304
+  scan_interval: '3600s'
+garbage_collector_options:
+  manifest_options:
+    interval: '300s'
+    min_age: '86400s'
+  wal_options:
+    interval: '60s'
+    min_age: '60s'
+  compacted_options:
+    interval: '300s'
+    min_age: '86400s'
+  compactions_options:
+    interval: '300s'
+    min_age: '86400s'
+```
+
+## See Also
+
+- [Cache Statistics](/api/cache-stats) - Monitor cache performance
+- [Database Statistics](/api/db-stats) - Monitor database operations

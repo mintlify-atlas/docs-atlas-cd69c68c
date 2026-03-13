@@ -1,0 +1,444 @@
+---
+title: 'Checkpoints'
+description: 'Create durable recovery points for backup and disaster recovery'
+---
+
+Checkpoints are durable, named recovery points stored in object storage. Unlike snapshots (which are process-local), checkpoints persist independently and can be used for backup, cloning, and disaster recovery.
+
+## Understanding Checkpoints
+
+Checkpoints provide:
+- **Durability**: Persisted in object storage
+- **Portability**: Can be used across database instances
+- **Point-in-time recovery**: Restore to a specific state
+- **Named references**: Optional names for easier management
+
+<Note>
+Checkpoints reference a specific manifest version. They prevent garbage collection of referenced data until the checkpoint is deleted.
+</Note>
+
+## Creating Checkpoints
+
+### Basic Checkpoint Creation
+
+Create a checkpoint from an open database:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = /* open database */;
+    
+    // Write some data
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    
+    // Create a checkpoint
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions::default()
+    ).await?;
+    
+    println!("Checkpoint ID: {}", result.id);
+    println!("Manifest ID: {}", result.manifest_id);
+    
+    Ok(())
+}
+```
+
+## Checkpoint Scopes
+
+### All Scope
+
+Includes all writes issued at the time of checkpoint creation:
+
+```rust
+use slatedb::config::CheckpointScope;
+
+// Flush and checkpoint all data
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default()
+).await?;
+```
+
+<Note>
+With `CheckpointScope::All`, SlateDB flushes the current WAL and memtable before creating the checkpoint, ensuring all data is included.
+</Note>
+
+### Durable Scope
+
+Includes only data already durably stored:
+
+```rust
+use slatedb::config::CheckpointScope;
+
+// Checkpoint only durable data (faster)
+let result = db.create_checkpoint(
+    CheckpointScope::Durable,
+    &CheckpointOptions::default()
+).await?;
+```
+
+<Tip>
+`CheckpointScope::Durable` is faster because it doesn't force a flush. Use this for frequent checkpointing.
+</Tip>
+
+## Checkpoint Options
+
+### Named Checkpoints
+
+Assign names to checkpoints for easier identification:
+
+```rust
+use slatedb::config::CheckpointOptions;
+
+let options = CheckpointOptions {
+    name: Some("daily-backup-2024-03-15".to_string()),
+    lifetime: None,
+    source: None,
+};
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &options
+).await?;
+```
+
+### Checkpoint Lifetime
+
+Set an expiration time for automatic cleanup:
+
+```rust
+use slatedb::config::CheckpointOptions;
+use std::time::Duration;
+
+let options = CheckpointOptions {
+    lifetime: Some(Duration::from_secs(86400)),  // 24 hours
+    name: Some("temp-backup".to_string()),
+    source: None,
+};
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &options
+).await?;
+```
+
+<Warning>
+Expired checkpoints may be garbage collected. Set appropriate lifetimes based on your recovery requirements.
+</Warning>
+
+### Creating from Existing Checkpoints
+
+Create a new checkpoint from an existing one:
+
+```rust
+use uuid::Uuid;
+
+// First checkpoint
+let cp1 = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default()
+).await?;
+
+// Create another checkpoint from the first
+let options = CheckpointOptions {
+    source: Some(cp1.id),
+    lifetime: Some(Duration::from_secs(3600)),
+    name: Some("derived-checkpoint".to_string()),
+};
+
+let cp2 = db.create_checkpoint(
+    CheckpointScope::All,
+    &options
+).await?;
+
+// cp2 references the same manifest as cp1
+assert_eq!(cp1.manifest_id, cp2.manifest_id);
+```
+
+## Detached Checkpoints
+
+Create checkpoints without an open database using the Admin API:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/tmp/slatedb";
+    
+    // Create admin client
+    let admin = AdminBuilder::new(path, object_store).build();
+    
+    // Create detached checkpoint
+    let result = admin.create_detached_checkpoint(
+        &CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)),
+            name: Some("backup-checkpoint".to_string()),
+            source: None,
+        }
+    ).await?;
+    
+    println!("Created checkpoint: {} at manifest {}",
+        result.id, result.manifest_id);
+    
+    Ok(())
+}
+```
+
+<Note>
+Detached checkpoints are useful for backup scripts and tools that operate independently of the main database process.
+</Note>
+
+## Managing Checkpoints
+
+### Refreshing Checkpoint Lifetime
+
+Extend the lifetime of an existing checkpoint:
+
+```rust
+use uuid::Uuid;
+use std::time::Duration;
+
+let checkpoint_id: Uuid = /* checkpoint ID */;
+
+// Extend lifetime by 1 hour
+admin.refresh_checkpoint(
+    checkpoint_id,
+    Some(Duration::from_secs(3600))
+).await?;
+```
+
+### Deleting Checkpoints
+
+Remove checkpoints to allow garbage collection:
+
+```rust
+use uuid::Uuid;
+
+let checkpoint_id: Uuid = /* checkpoint ID */;
+
+admin.delete_checkpoint(checkpoint_id).await?;
+```
+
+<Warning>
+Deleting a checkpoint allows its referenced data to be garbage collected. Ensure you don't need the checkpoint before deletion.
+</Warning>
+
+## Practical Use Cases
+
+### Daily Backup Strategy
+
+```rust
+use chrono::Utc;
+use std::time::Duration;
+
+async fn create_daily_backup(db: &Db) -> Result<(), Error> {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    
+    let options = CheckpointOptions {
+        name: Some(format!("daily-backup-{}", today)),
+        lifetime: Some(Duration::from_secs(30 * 86400)),  // 30 days
+        source: None,
+    };
+    
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &options
+    ).await?;
+    
+    println!("Created daily backup: {} (checkpoint: {})",
+        today, result.id);
+    
+    Ok(())
+}
+```
+
+### Disaster Recovery
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+
+async fn restore_from_checkpoint(
+    source_store: Arc<dyn ObjectStore>,
+    dest_store: Arc<dyn ObjectStore>,
+    checkpoint_id: Uuid,
+) -> Result<(), Error> {
+    // Open source database at checkpoint
+    let source_admin = AdminBuilder::new(
+        "/source/db",
+        source_store
+    ).build();
+    
+    // Copy checkpoint to new location
+    // (implementation would involve copying referenced SSTs)
+    
+    Ok(())
+}
+```
+
+### Testing and Development
+
+```rust
+async fn create_test_checkpoint(db: &Db) -> Result<Uuid, Error> {
+    // Create checkpoint with test data
+    let options = CheckpointOptions {
+        name: Some("test-data-snapshot".to_string()),
+        lifetime: Some(Duration::from_secs(3600)),  // 1 hour
+        source: None,
+    };
+    
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &options
+    ).await?;
+    
+    Ok(result.id)
+}
+```
+
+## Complete Example
+
+Here's a comprehensive checkpoint management example:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::admin::AdminBuilder;
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/tmp/checkpoint_example";
+    
+    // Open database
+    let db = Db::open(path, object_store.clone()).await?;
+    
+    // Write initial data
+    db.put(b"config:version", b"1.0").await?;
+    db.put(b"users:count", b"100").await?;
+    
+    // Create checkpoint after initial setup
+    let cp1 = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            name: Some("initial-state".to_string()),
+            lifetime: Some(Duration::from_secs(86400)),
+            source: None,
+        }
+    ).await?;
+    println!("Created initial checkpoint: {}", cp1.id);
+    
+    // Make more changes
+    db.put(b"users:count", b"150").await?;
+    db.put(b"config:version", b"1.1").await?;
+    
+    // Create another checkpoint
+    let cp2 = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            name: Some("after-updates".to_string()),
+            lifetime: Some(Duration::from_secs(3600)),
+            source: None,
+        }
+    ).await?;
+    println!("Created second checkpoint: {}", cp2.id);
+    
+    db.close().await?;
+    
+    // Use admin API for management
+    let admin = AdminBuilder::new(path, object_store).build();
+    
+    // Refresh checkpoint lifetime
+    admin.refresh_checkpoint(
+        cp1.id,
+        Some(Duration::from_secs(172800))  // 48 hours
+    ).await?;
+    
+    // Delete old checkpoint
+    admin.delete_checkpoint(cp2.id).await?;
+    println!("Deleted checkpoint: {}", cp2.id);
+    
+    Ok(())
+}
+```
+
+## Checkpoint Metadata
+
+Checkpoints include important metadata:
+
+```rust
+use slatedb::checkpoint::Checkpoint;
+
+let checkpoint: Checkpoint = /* ... */;
+
+println!("ID: {}", checkpoint.id);
+println!("Manifest ID: {}", checkpoint.manifest_id);
+println!("Created: {:?}", checkpoint.create_time);
+println!("Expires: {:?}", checkpoint.expire_time);
+println!("Name: {:?}", checkpoint.name);
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Use Named Checkpoints">
+    Assign descriptive names to checkpoints for easier identification and management.
+  </Step>
+  
+  <Step title="Set Appropriate Lifetimes">
+    Balance retention needs with storage costs by setting reasonable expiration times.
+  </Step>
+  
+  <Step title="Clean Up Old Checkpoints">
+    Regularly delete unnecessary checkpoints to allow garbage collection and reduce costs.
+  </Step>
+  
+  <Step title="Test Recovery Procedures">
+    Regularly verify that you can restore from checkpoints in your disaster recovery plan.
+  </Step>
+</Steps>
+
+<Tip>
+Checkpoints are lightweight metadata references. The cost is mainly in preventing garbage collection of referenced data.
+</Tip>
+
+## Checkpoints vs Snapshots
+
+| Feature | Checkpoints | Snapshots |
+|---------|-------------|----------|
+| **Storage** | Object storage (durable) | In-process (ephemeral) |
+| **Lifetime** | Configurable, persistent | Process lifetime |
+| **Use Case** | Backup, recovery, cloning | Consistent reads, analytics |
+| **Creation Cost** | Requires flush | Instant |
+| **Portability** | Cross-instance | Single process |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Use in-process consistent views
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Configure garbage collection
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/guides/basic-operations">
+    Learn fundamental operations
+  </Card>
+  <Card title="Change Data Capture" icon="stream" href="/guides/change-data-capture">
+    Track changes over time
+  </Card>
+</CardGroup>

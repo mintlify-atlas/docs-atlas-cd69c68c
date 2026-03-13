@@ -1,0 +1,480 @@
+---
+title: Installation
+description: Install SlateDB for Rust, Python, Java, and Go
+---
+
+SlateDB provides official bindings for multiple programming languages. Choose your language below to get started.
+
+<Note>
+  All SlateDB language bindings share the same core engine, ensuring consistent behavior and performance across languages.
+</Note>
+
+## Rust
+
+SlateDB is natively written in Rust and provides the most direct access to all features.
+
+### Requirements
+
+- Rust 1.75 or higher (specified in the repository's `rust-toolchain.toml`)
+- Tokio runtime for async operations
+
+### Installation
+
+Add SlateDB to your `Cargo.toml`:
+
+<CodeGroup>
+
+```toml Cargo.toml
+[dependencies]
+slatedb = "*"  # Use latest version
+tokio = { version = "1", features = ["full"] }
+```
+
+```bash cargo add
+cargo add slatedb
+cargo add tokio --features full
+```
+
+</CodeGroup>
+
+### Features
+
+SlateDB supports several optional features:
+
+```toml Cargo.toml
+[dependencies]
+slatedb = { version = "*", features = [
+    "aws",        # AWS S3 support (enabled by default)
+    "azure",      # Azure Blob Storage support
+    "snappy",     # Snappy compression
+    "lz4",        # LZ4 compression
+    "zstd",       # Zstd compression
+    "zlib",       # Zlib compression
+    "foyer",      # Foyer block cache (enabled by default)
+    "moka",       # Moka cache alternative
+    "opendal",    # OpenDAL object store integration
+] }
+```
+
+<Accordion title="Feature descriptions">
+  - **aws** (default): Enable AWS S3 support via object_store crate
+  - **azure**: Enable Azure Blob Storage support
+  - **compression**: Umbrella feature for Snappy compression
+  - **snappy**: Snappy compression algorithm
+  - **lz4**: LZ4 compression algorithm
+  - **zstd**: Zstandard compression algorithm
+  - **zlib**: Zlib compression algorithm
+  - **foyer** (default): High-performance block cache
+  - **moka**: Alternative cache implementation
+  - **opendal**: Integration with Apache OpenDAL
+  - **compaction_filters**: Enable custom compaction filter API
+</Accordion>
+
+### Verification
+
+Create a simple test to verify installation:
+
+```rust main.rs
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/test_db", object_store).await?;
+    println!("SlateDB installed successfully!");
+    db.close().await?;
+    Ok(())
+}
+```
+
+Run with:
+
+```bash
+cargo run
+```
+
+---
+
+## Python
+
+SlateDB's Python bindings provide both synchronous and asynchronous APIs.
+
+### Requirements
+
+- Python 3.10 or higher
+- pip or uv package manager
+
+### Installation
+
+<CodeGroup>
+
+```bash pip
+pip install slatedb
+```
+
+```bash uv
+uv pip install slatedb
+```
+
+```bash poetry
+poetry add slatedb
+```
+
+</CodeGroup>
+
+### Verification
+
+Create a test script to verify installation:
+
+```python test_slatedb.py
+from slatedb import SlateDB
+
+# Open database with in-memory object store
+db = SlateDB("/tmp/test_db", url="memory:///")
+
+# Basic operation
+db.put(b"key", b"value")
+value = db.get(b"key")
+
+print(f"SlateDB installed successfully! Value: {value}")
+
+db.close()
+```
+
+Run with:
+
+```bash
+python test_slatedb.py
+```
+
+### Building from Source
+
+For development or custom builds:
+
+<Steps>
+  <Step title="Install uv">
+    Follow instructions at [docs.astral.sh/uv](https://docs.astral.sh/uv/)
+  </Step>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/slatedb/slatedb.git
+    cd slatedb/slatedb-py
+    ```
+  </Step>
+  <Step title="Install Maturin">
+    ```bash
+    uv tool install maturin
+    ```
+  </Step>
+  <Step title="Build and install">
+    ```bash
+    uv venv
+    uv run maturin develop
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Java
+
+SlateDB's Java bindings require Java 24+ and use the Foreign Function & Memory (FFM) API for zero-overhead native calls.
+
+### Requirements
+
+- Java 24 or higher (required for FFM API)
+- Gradle or Maven build system
+- Rust toolchain (only if building from source)
+
+### Installation
+
+<CodeGroup>
+
+```groovy Gradle (Groovy)
+dependencies {
+    implementation "io.slatedb:slatedb:${slatedbVersion}"
+}
+```
+
+```kotlin Gradle (Kotlin)
+dependencies {
+    implementation("io.slatedb:slatedb:$slatedbVersion")
+}
+```
+
+```xml Maven
+<dependency>
+  <groupId>io.slatedb</groupId>
+  <artifactId>slatedb</artifactId>
+  <version>${slatedb.version}</version>
+</dependency>
+```
+
+</CodeGroup>
+
+<Note>
+  The published JAR includes native libraries for Linux (x86_64/aarch64), macOS (x86_64/aarch64), and Windows (x86_64/aarch64). No additional setup is required.
+</Note>
+
+### Verification
+
+Create a test class:
+
+```java HelloSlateDb.java
+import io.slatedb.SlateDb;
+import io.slatedb.SlateDbConfig;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class HelloSlateDb {
+    public static void main(String[] args) throws Exception {
+        SlateDb.initLogging(SlateDbConfig.LogLevel.INFO);
+        
+        Path dbPath = Files.createTempDirectory("slatedb-test");
+        String objectStoreUrl = "memory:///";
+        
+        try (SlateDb db = SlateDb.open(dbPath.toString(), objectStoreUrl, null)) {
+            byte[] key = "test".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "hello".getBytes(StandardCharsets.UTF_8);
+            
+            db.put(key, value);
+            byte[] result = db.get(key);
+            
+            System.out.println("SlateDB installed successfully!");
+            System.out.println("Value: " + new String(result, StandardCharsets.UTF_8));
+        }
+    }
+}
+```
+
+Compile and run:
+
+```bash
+javac -cp "path/to/slatedb.jar" HelloSlateDb.java
+java --enable-native-access=ALL-UNNAMED -cp "path/to/slatedb.jar:." HelloSlateDb
+```
+
+<Warning>
+  You must use `--enable-native-access=ALL-UNNAMED` when running Java applications with SlateDB to allow FFM API calls.
+</Warning>
+
+### Building from Source
+
+<Steps>
+  <Step title="Clone repository">
+    ```bash
+    git clone https://github.com/slatedb/slatedb.git
+    cd slatedb/slatedb-java
+    ```
+  </Step>
+  <Step title="Build with Gradle">
+    ```bash
+    ./gradlew jar
+    ```
+  </Step>
+  <Step title="Find the JAR">
+    The JAR will be at `build/libs/slatedb-<version>.jar`
+  </Step>
+</Steps>
+
+---
+
+## Go
+
+SlateDB's Go bindings use CGo to interface with the native `slatedb-c` library.
+
+### Requirements
+
+- Go 1.25 or higher
+- CGO enabled
+- C compiler (gcc, clang, or MSVC)
+- Rust toolchain (to build slatedb-c)
+
+### Installation
+
+Add SlateDB to your Go module:
+
+```bash
+go get slatedb.io/slatedb-go
+```
+
+### Building slatedb-c
+
+The Go bindings require the native `slatedb-c` library:
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/slatedb/slatedb.git
+    cd slatedb
+    ```
+  </Step>
+  <Step title="Build slatedb-c">
+    ```bash
+    cargo build --release -p slatedb-c
+    ```
+  </Step>
+  <Step title="Set library path">
+    ```bash
+    # macOS
+    export DYLD_LIBRARY_PATH="$(pwd)/target/release:$DYLD_LIBRARY_PATH"
+    
+    # Linux
+    export LD_LIBRARY_PATH="$(pwd)/target/release:$LD_LIBRARY_PATH"
+    ```
+  </Step>
+</Steps>
+
+### Verification
+
+Create a test program:
+
+```go main.go
+package main
+
+import (
+    "fmt"
+    "slatedb.io/slatedb-go"
+)
+
+func main() {
+    db, err := slatedb.Open("/tmp/test_db", 
+        slatedb.WithUrl[slatedb.DbConfig]("memory:///"))
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+    
+    key := []byte("test")
+    value := []byte("hello")
+    
+    if err := db.Put(key, value); err != nil {
+        panic(err)
+    }
+    
+    result, err := db.Get(key)
+    if err != nil {
+        panic(err)
+    }
+    
+    fmt.Println("SlateDB installed successfully!")
+    fmt.Printf("Value: %s\n", result)
+}
+```
+
+Run with:
+
+```bash
+cd slatedb-go/go
+go run main.go
+```
+
+<Tip>
+  Make sure the `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) environment variable includes the path to `libslatedb_c.dylib` or `libslatedb_c.so`.
+</Tip>
+
+---
+
+## Object Storage Configuration
+
+Regardless of language, you'll need to configure access to your object storage. SlateDB supports multiple configuration methods:
+
+### Using URLs
+
+The simplest method is to provide an object store URL:
+
+<CodeGroup>
+
+```rust Rust
+let object_store = ObjectStoreBuilder::from_url("s3://my-bucket/prefix")?;
+let db = Db::open("/tmp/db", object_store).await?;
+```
+
+```python Python
+db = SlateDB("/tmp/db", url="s3://my-bucket/prefix")
+```
+
+```java Java
+SlateDb db = SlateDb.open("/tmp/db", "s3://my-bucket/prefix", null);
+```
+
+```go Go
+db, err := slatedb.Open("/tmp/db", 
+    slatedb.WithUrl[slatedb.DbConfig]("s3://my-bucket/prefix"))
+```
+
+</CodeGroup>
+
+Supported URL schemes:
+- `s3://` - Amazon S3
+- `gs://` - Google Cloud Storage
+- `az://` or `azure://` - Azure Blob Storage
+- `file://` - Local filesystem
+- `memory://` - In-memory (testing)
+
+### Using Environment Variables
+
+SlateDB can also read configuration from environment variables:
+
+<CodeGroup>
+
+```bash S3
+export CLOUD_PROVIDER=aws
+export AWS_BUCKET=my-bucket
+export AWS_REGION=us-west-2
+export AWS_ACCESS_KEY_ID=your-key
+export AWS_SECRET_ACCESS_KEY=your-secret
+```
+
+```bash GCS
+export CLOUD_PROVIDER=gcs
+export GCS_BUCKET=my-bucket
+export GOOGLE_SERVICE_ACCOUNT=/path/to/service-account.json
+```
+
+```bash Azure
+export CLOUD_PROVIDER=azure
+export AZURE_STORAGE_ACCOUNT=myaccount
+export AZURE_STORAGE_ACCESS_KEY=your-key
+export AZURE_CONTAINER=my-container
+```
+
+</CodeGroup>
+
+<Note>
+  When using environment variables, you can omit the URL parameter when opening the database. SlateDB will automatically detect and use the configured provider.
+</Note>
+
+### Using Configuration Files
+
+You can also load settings from `.env`, `.json`, `.toml`, or `.yaml` files. See the [Configuration guide](/guides/configuration) for details.
+
+---
+
+## Next Steps
+
+Now that you've installed SlateDB, you're ready to build your first application:
+
+<Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+  Follow our quickstart guide to build a complete SlateDB application in minutes
+</Card>
+
+Or explore language-specific documentation:
+
+<CardGroup cols={2}>
+  <Card title="Rust Guide" icon="rust" href="/bindings/rust">
+    Deep dive into Rust-specific features and patterns
+  </Card>
+  <Card title="Python Guide" icon="python" href="/bindings/python">
+    Learn about Python's sync and async APIs
+  </Card>
+  <Card title="Java Guide" icon="java" href="/bindings/java">
+    Explore Java FFM integration and best practices
+  </Card>
+  <Card title="Go Guide" icon="golang" href="/bindings/go">
+    Discover Go-specific patterns and configuration
+  </Card>
+</CardGroup>

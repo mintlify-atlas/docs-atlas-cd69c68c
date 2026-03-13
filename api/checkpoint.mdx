@@ -1,0 +1,309 @@
+---
+title: "Checkpoint"
+description: "Create and manage durable recovery points in SlateDB"
+---
+
+## Overview
+
+Checkpoints provide durable recovery points that allow you to:
+
+- Create point-in-time snapshots of your database
+- Restore to a specific point in time
+- Implement backup and recovery strategies
+- Clone databases at a specific version
+
+## Checkpoint Structure
+
+A checkpoint contains metadata about a specific database state:
+
+<ResponseField name="id" type="Uuid">
+  Unique identifier for the checkpoint
+</ResponseField>
+
+<ResponseField name="manifest_id" type="u64">
+  The manifest version this checkpoint references
+</ResponseField>
+
+<ResponseField name="create_time" type="DateTime<Utc>">
+  When the checkpoint was created
+</ResponseField>
+
+<ResponseField name="expire_time" type="Option<DateTime<Utc>>">
+  Optional expiration time for automatic cleanup
+</ResponseField>
+
+<ResponseField name="name" type="Option<String>">
+  Optional human-readable name
+</ResponseField>
+
+## Creating Checkpoints
+
+### create_checkpoint
+
+Create a new checkpoint of the database.
+
+<ParamField path="scope" type="CheckpointScope" required>
+  The scope of data to include in the checkpoint (All or MemtableOnly)
+</ParamField>
+
+<ParamField path="options" type="CheckpointOptions" required>
+  Configuration options for the checkpoint
+</ParamField>
+
+<ResponseField name="result" type="CheckpointCreateResult">
+  Contains the checkpoint ID and manifest ID
+</ResponseField>
+
+```rust
+use slatedb::{
+    Db,
+    config::{CheckpointOptions, CheckpointScope},
+};
+use chrono::{Duration, Utc};
+
+let db = Db::open("/tmp/db", object_store).await?;
+
+// Create a checkpoint of all data
+let options = CheckpointOptions {
+    name: Some("backup-2024-03-13".to_string()),
+    expire_time: Some(Utc::now() + Duration::days(30)),
+};
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &options
+).await?;
+
+println!("Created checkpoint: {}", result.id);
+println!("Manifest ID: {}", result.manifest_id);
+```
+
+## Checkpoint Scopes
+
+### CheckpointScope::All
+
+Flushes all data (WAL and memtables) before creating the checkpoint:
+
+```rust
+use slatedb::config::CheckpointScope;
+
+// Ensures all data is persisted to SSTs
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &options
+).await?;
+```
+
+<Note>
+  This is the recommended scope for backup and recovery scenarios.
+</Note>
+
+### CheckpointScope::MemtableOnly
+
+Creates a checkpoint without flushing WAL or memtables:
+
+```rust
+// Faster but may reference in-memory data
+let result = db.create_checkpoint(
+    CheckpointScope::MemtableOnly,
+    &options
+).await?;
+```
+
+<Warning>
+  MemtableOnly checkpoints may reference data still in memory. Use CheckpointScope::All for durable recovery points.
+</Warning>
+
+## Checkpoint Options
+
+Configure checkpoint behavior with `CheckpointOptions`:
+
+<ParamField path="name" type="Option<String>">
+  Human-readable name for the checkpoint
+</ParamField>
+
+<ParamField path="expire_time" type="Option<DateTime<Utc>>">
+  When the checkpoint should be automatically deleted
+</ParamField>
+
+```rust
+use chrono::{Duration, Utc};
+use slatedb::config::CheckpointOptions;
+
+let options = CheckpointOptions {
+    name: Some("pre-migration".to_string()),
+    expire_time: Some(Utc::now() + Duration::hours(24)),
+};
+```
+
+## Listing Checkpoints
+
+Use the Admin API to list all checkpoints:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+let admin = AdminBuilder::new(object_store)
+    .build()
+    .await?;
+
+let checkpoints = admin.list_checkpoints().await?;
+for checkpoint in checkpoints {
+    println!("ID: {}", checkpoint.id);
+    println!("Name: {:?}", checkpoint.name);
+    println!("Created: {}", checkpoint.create_time);
+    println!("Manifest: {}", checkpoint.manifest_id);
+}
+```
+
+## Opening from Checkpoint
+
+Open a database at a specific checkpoint:
+
+```rust
+use slatedb::{DbBuilder, admin::AdminBuilder};
+
+// List checkpoints and find the one we want
+let admin = AdminBuilder::new(object_store.clone())
+    .build()
+    .await?;
+let checkpoints = admin.list_checkpoints().await?;
+let checkpoint = checkpoints.iter()
+    .find(|c| c.name.as_deref() == Some("backup-2024-03-13"))
+    .unwrap();
+
+// Open database at that checkpoint
+let db = DbBuilder::new(object_store)
+    .with_checkpoint(checkpoint.clone())
+    .build()
+    .await?;
+
+// Database state is now at the checkpoint
+let value = db.get(b"key").await?;
+```
+
+## Deleting Checkpoints
+
+Use the Admin API to delete a checkpoint:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+let admin = AdminBuilder::new(object_store)
+    .build()
+    .await?;
+
+// Delete a specific checkpoint
+admin.delete_checkpoint(checkpoint_id).await?;
+```
+
+<Warning>
+  Deleting a checkpoint may allow the garbage collector to remove SSTs that were kept alive only by that checkpoint.
+</Warning>
+
+## Refreshing Checkpoints
+
+Update a checkpoint's expiration time:
+
+```rust
+use chrono::{Duration, Utc};
+
+// Extend checkpoint lifetime by 7 days
+let new_expire_time = Utc::now() + Duration::days(7);
+admin.refresh_checkpoint(checkpoint_id, new_expire_time).await?;
+```
+
+## Complete Example
+
+```rust
+use slatedb::{
+    Db, DbBuilder,
+    admin::AdminBuilder,
+    config::{CheckpointOptions, CheckpointScope},
+};
+use chrono::{Duration, Utc};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(/* your object store */);
+
+    // Open database and write some data
+    let db = Db::open("/tmp/db", object_store.clone()).await?;
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+
+    // Create a checkpoint
+    let options = CheckpointOptions {
+        name: Some("before-update".to_string()),
+        expire_time: Some(Utc::now() + Duration::days(7)),
+    };
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &options
+    ).await?;
+    println!("Created checkpoint: {}", result.id);
+
+    // Continue making changes
+    db.put(b"key1", b"updated").await?;
+    db.delete(b"key2").await?;
+    db.close().await?;
+
+    // Later: restore from checkpoint
+    let admin = AdminBuilder::new(object_store.clone())
+        .build()
+        .await?;
+    let checkpoints = admin.list_checkpoints().await?;
+    let checkpoint = checkpoints.iter()
+        .find(|c| c.name.as_deref() == Some("before-update"))
+        .unwrap();
+
+    let restored_db = DbBuilder::new(object_store.clone())
+        .with_checkpoint(checkpoint.clone())
+        .build()
+        .await?;
+
+    // Database is at the checkpoint state
+    assert_eq!(restored_db.get(b"key1").await?, Some("value1".into()));
+    assert_eq!(restored_db.get(b"key2").await?, Some("value2".into()));
+
+    Ok(())
+}
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Backups" icon="floppy-disk">
+    Create periodic checkpoints for point-in-time recovery
+  </Card>
+  <Card title="Testing" icon="flask">
+    Create checkpoints before risky operations to enable quick rollback
+  </Card>
+  <Card title="Auditing" icon="file-magnifying-glass">
+    Preserve database state at important business events
+  </Card>
+  <Card title="Cloning" icon="copy">
+    Create read-only copies of the database at specific points in time
+  </Card>
+</CardGroup>
+
+## Best Practices
+
+<Tip>
+  Use CheckpointScope::All for production backups to ensure all data is persisted to object storage.
+</Tip>
+
+<Tip>
+  Set expiration times on checkpoints to allow automatic cleanup by the garbage collector.
+</Tip>
+
+<Note>
+  Checkpoints are lightweight - they only store metadata, not data copies. The actual SSTs are shared.
+</Note>
+
+## See Also
+
+- [Checkpoints Guide](/guides/checkpoints) - Comprehensive checkpoint usage guide
+- [Admin](/api/db) - Admin API for managing checkpoints
+- [DbBuilder](/api/db-builder) - Opening databases from checkpoints

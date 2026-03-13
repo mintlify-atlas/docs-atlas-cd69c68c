@@ -1,0 +1,235 @@
+---
+title: Examples Overview
+description: Learn from complete, runnable SlateDB examples covering basic operations and cloud storage integrations
+---
+
+## Introduction
+
+SlateDB provides a comprehensive set of examples demonstrating how to use the database in various scenarios. Each example is a standalone Rust program that you can run independently. These examples are maintained in the main repository and built in CI to ensure they stay up-to-date.
+
+## Available Examples
+
+### Getting Started
+
+<CardGroup cols={2}>
+  <Card title="Simple Example" icon="rocket" href="#simple-example">
+    Basic put and get operations with in-memory storage
+  </Card>
+  <Card title="Full Example" icon="code" href="#full-example">
+    Complete workflow with put, get, delete, and scan operations
+  </Card>
+</CardGroup>
+
+### Cloud Storage Integrations
+
+<CardGroup cols={3}>
+  <Card title="S3 Storage" icon="aws" href="/examples/s3-storage">
+    Connect SlateDB to AWS S3 or S3-compatible storage
+  </Card>
+  <Card title="Azure Blob" icon="microsoft" href="/examples/azure-blob">
+    Use Azure Blob Storage as the backend
+  </Card>
+  <Card title="Google Cloud" icon="google" href="/examples/google-cloud">
+    Integrate with Google Cloud Storage
+  </Card>
+</CardGroup>
+
+### Advanced Features
+
+<CardGroup cols={2}>
+  <Card title="Standalone Compactor" icon="server" href="/examples/standalone-compactor">
+    Run compaction as a separate process
+  </Card>
+  <Card title="Checkpoints" icon="bookmark">
+    Create, refresh, and delete database checkpoints
+  </Card>
+</CardGroup>
+
+## Running Examples
+
+All examples are located in the `examples/` directory of the SlateDB repository.
+
+### Build and Run
+
+```bash
+cd examples
+cargo run --bin <example-name>
+```
+
+Replace `<example-name>` with the desired example:
+- `simple-example`
+- `full-example`
+- `s3-compatible`
+- `azure-blob-storage`
+- `google-cloud-storage`
+- `standalone-compactor`
+- And more...
+
+### Prerequisites
+
+Most examples require:
+- Rust toolchain (1.70 or later)
+- Tokio async runtime
+- Access to object storage (for cloud examples)
+
+## Simple Example
+
+The simplest way to get started with SlateDB:
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/slatedb_simple_example", object_store).await?;
+
+    db.put(b"key", b"value").await?;
+
+    match db.get(b"key").await? {
+        Some(value) => println!("value: {value:?}"),
+        None => println!("value not found"),
+    }
+
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/simple_example.rs`
+
+## Full Example
+
+A comprehensive example demonstrating all core operations:
+
+```rust
+use slatedb::{object_store::memory::InMemory, Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store = Arc::new(InMemory::new());
+    let kv_store = Db::open("/tmp/slatedb_full_example", object_store).await?;
+
+    // Put
+    let key = b"test_key";
+    let value = b"test_value";
+    kv_store.put(key, value).await?;
+
+    // Get
+    assert_eq!(kv_store.get(key).await?, Some("test_value".into()));
+
+    // Delete
+    kv_store.delete(key).await?;
+    assert!(kv_store.get(key).await?.is_none());
+
+    // Put multiple keys
+    kv_store.put(b"test_key1", b"test_value1").await?;
+    kv_store.put(b"test_key2", b"test_value2").await?;
+    kv_store.put(b"test_key3", b"test_value3").await?;
+    kv_store.put(b"test_key4", b"test_value4").await?;
+
+    // Scan over unbound range
+    let mut iter = kv_store.scan::<Vec<u8>, _>(..).await?;
+    while let Ok(Some(item)) = iter.next().await {
+        println!("Key: {:?}, Value: {:?}", item.key, item.value);
+    }
+
+    // Scan over bound range
+    let mut iter = kv_store.scan("test_key1"..="test_key2").await?;
+    let kv1 = iter.next().await?.unwrap();
+    assert_eq!(kv1.key, b"test_key1".as_slice());
+
+    // Seek to specific key
+    let mut iter = kv_store.scan::<Vec<u8>, _>(..).await?;
+    iter.seek(b"test_key4").await?;
+    let kv4 = iter.next().await?.unwrap();
+    assert_eq!(kv4.key, b"test_key4".as_slice());
+
+    // Close
+    kv_store.close().await?;
+
+    Ok(())
+}
+```
+
+**Source**: `examples/src/full_example.rs`
+
+## Key Operations Demonstrated
+
+### Basic Operations
+- **Put**: Store key-value pairs
+- **Get**: Retrieve values by key
+- **Delete**: Remove keys from the database
+- **Close**: Properly shut down the database
+
+### Range Queries
+- **Scan**: Iterate over key ranges
+- **Seek**: Jump to specific keys in an iterator
+- **Bound ranges**: Query specific key ranges
+
+### Advanced Features
+- **Flush**: Force durability of writes
+- **Checkpoints**: Create point-in-time snapshots
+- **Compaction**: Manage data organization
+- **CDC**: Track database changes
+
+## Example Structure
+
+Each example follows a consistent pattern:
+
+1. **Setup**: Initialize object store and open database
+2. **Operations**: Perform database operations
+3. **Cleanup**: Flush pending writes and close database
+4. **Error handling**: Proper error propagation with `anyhow` or `slatedb::Error`
+
+## Dependencies
+
+Examples use the following dependencies:
+
+```toml
+[dependencies]
+anyhow = "1.0"
+object_store = { version = "0.11", features = ["azure", "gcp"] }
+slatedb = "0.2"
+tokio = { version = "1", features = ["macros", "signal"] }
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="S3 Storage" icon="aws" href="/examples/s3-storage">
+    Connect to S3 or LocalStack
+  </Card>
+  <Card title="Basic Operations" icon="book" href="/guides/basic-operations">
+    Learn database fundamentals
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Customize database behavior
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/db">
+    Explore the full API
+  </Card>
+</CardGroup>
+
+## Contributing Examples
+
+To add a new example:
+
+1. Create a new Rust file in `examples/src/`
+2. Add the binary definition to `Cargo.toml`:
+   ```toml
+   [[bin]]
+   name = "your-example"
+   path = "src/your_example.rs"
+   test = false
+   bench = false
+   ```
+3. Add any required dependencies
+4. Ensure the example builds and runs successfully
+
+All examples are built in CI to ensure they remain functional as SlateDB evolves.

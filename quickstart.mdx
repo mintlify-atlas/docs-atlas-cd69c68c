@@ -1,80 +1,302 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Get up and running with SlateDB in under 5 minutes"
 ---
 
-## Get started in three steps
+This guide will get you from zero to a working SlateDB application in under 5 minutes.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- Rust 1.70 or later
+- Basic familiarity with async Rust and Tokio
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+## Step 1: Create a New Project
+
+<Steps>
+  <Step title="Create a new Rust project">
+    ```bash
+    cargo new slatedb-quickstart
+    cd slatedb-quickstart
+    ```
+  </Step>
+
+  <Step title="Add dependencies">
+    Add SlateDB and Tokio to your `Cargo.toml`:
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    ```toml Cargo.toml
+    [dependencies]
+    slatedb = "*"
+    tokio = { version = "1", features = ["full"] }
+    ```
+  </Step>
+</Steps>
+
+## Step 2: Write Your First SlateDB Program
+
+Replace the contents of `src/main.rs` with:
+
+```rust src/main.rs lines
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Create an in-memory object store
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    // Open the database
+    let db = Db::open("/tmp/quickstart", object_store).await?;
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    // Write a key-value pair
+    db.put(b"hello", b"world").await?;
+    
+    // Read it back
+    let value = db.get(b"hello").await?;
+    println!("Value: {:?}", value); // Some(b"world")
+    
+    // Close the database
+    db.close().await?;
+    
+    Ok(())
+}
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+## Step 3: Run Your Program
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+cargo run
+```
 
-### Step 3: Go live
+You should see:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```
+Value: Some(b"world")
+```
 
-## Next steps
+Congratulations! You've just created your first SlateDB application.
 
-Now that you have your docs running, explore these key features:
+## Next Steps: Core Operations
+
+Now let's explore the core operations you'll use in SlateDB.
+
+### Writing Data
+
+```rust
+// Put a single key-value pair
+db.put(b"user:1", b"Alice").await?;
+
+// Put with options (customize durability)
+use slatedb::config::PutOptions;
+db.put_with_options(
+    b"user:2", 
+    b"Bob",
+    &PutOptions {
+        await_durable: false, // Don't wait for flush
+    }
+).await?;
+
+// Delete a key
+db.delete(b"user:1").await?;
+```
+
+### Reading Data
+
+```rust
+// Get a single value
+if let Some(value) = db.get(b"user:2").await? {
+    println!("User: {:?}", value);
+}
+
+// Get with options
+use slatedb::config::ReadOptions;
+let value = db.get_with_options(
+    b"user:2",
+    &ReadOptions::default()
+).await?;
+```
+
+### Batch Operations
+
+```rust
+use slatedb::WriteBatch;
+
+// Create a batch
+let mut batch = WriteBatch::new();
+batch.put(b"user:1", b"Alice");
+batch.put(b"user:2", b"Bob");
+batch.put(b"user:3", b"Charlie");
+
+// Write atomically
+let handle = db.write_batch(batch).await?;
+println!("Batch committed at seq: {}", handle.seqnum());
+```
+
+### Range Queries
+
+```rust
+// Scan all keys with prefix "user:"
+let mut iter = db.scan(b"user:"..b"user:~").await?;
+while let Some(kv) = iter.next().await? {
+    println!("{:?} = {:?}", kv.key, kv.value);
+}
+
+// Scan with specific bounds
+let mut iter = db.scan(b"user:1"..=b"user:2").await?;
+while let Some(kv) = iter.next().await? {
+    println!("{:?} = {:?}", kv.key, kv.value);
+}
+
+// Seek to a specific key
+let mut iter = db.scan(..).await?;
+iter.seek(b"user:2").await?;
+if let Some(kv) = iter.next().await? {
+    println!("Found: {:?}", kv.key);
+}
+```
+
+## Using Real Object Storage
+
+The in-memory store is great for testing, but let's use a real object store:
+
+<Tabs>
+  <Tab title="AWS S3">
+    ```rust
+    use object_store::aws::AmazonS3Builder;
+    use std::sync::Arc;
+
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name("my-bucket")
+            .with_region("us-east-1")
+            .build()?
+    );
+
+    let db = Db::open("/mydb", object_store).await?;
+    ```
+  </Tab>
+
+  <Tab title="Google Cloud Storage">
+    ```rust
+    use object_store::gcp::GoogleCloudStorageBuilder;
+    use std::sync::Arc;
+
+    let object_store = Arc::new(
+        GoogleCloudStorageBuilder::new()
+            .with_bucket_name("my-bucket")
+            .with_service_account_path("service-account.json")
+            .build()?
+    );
+
+    let db = Db::open("/mydb", object_store).await?;
+    ```
+  </Tab>
+
+  <Tab title="Azure Blob Storage">
+    ```rust
+    use object_store::azure::MicrosoftAzureBuilder;
+    use std::sync::Arc;
+
+    let object_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_container_name("my-container")
+            .with_account("my-account")
+            .with_access_key("access-key")
+            .build()?
+    );
+
+    let db = Db::open("/mydb", object_store).await?;
+    ```
+  </Tab>
+</Tabs>
+
+## Complete Example
+
+Here's a complete example showing common operations:
+
+```rust
+use slatedb::{Db, WriteBatch, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/quickstart", object_store).await?;
+
+    // Write some data
+    db.put(b"user:1:name", b"Alice").await?;
+    db.put(b"user:1:email", b"alice@example.com").await?;
+    db.put(b"user:2:name", b"Bob").await?;
+    db.put(b"user:2:email", b"bob@example.com").await?;
+
+    // Read a specific key
+    let name = db.get(b"user:1:name").await?;
+    println!("Name: {:?}", name);
+
+    // Scan a range
+    println!("\\nAll user:1 data:");
+    let mut iter = db.scan(b"user:1:"..b"user:1:~").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("  {:?} = {:?}", kv.key, kv.value);
+    }
+
+    // Batch update
+    let mut batch = WriteBatch::new();
+    batch.put(b"user:1:name", b"Alice Smith");
+    batch.put(b"user:1:phone", b"555-1234");
+    db.write_batch(batch).await?;
+
+    // Delete
+    db.delete(b"user:2:email").await?;
+
+    // Flush to object storage
+    db.flush().await?;
+
+    // Close
+    db.close().await?;
+
+    println!("\\nDone!");
+    Ok(())
+}
+```
+
+## What's Next?
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Learn how SlateDB works under the hood
+  </Card>
+  <Card title="Basic Operations" icon="terminal" href="/guides/basic-operations">
+    Explore all the database operations in detail
+  </Card>
+  <Card title="Transactions" icon="arrows-rotate" href="/guides/transactions">
+    Use ACID transactions for atomic updates
+  </Card>
+  <Card title="Configuration" icon="gear" href="/guides/configuration">
+    Tune SlateDB for your workload
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+## Troubleshooting
+
+<Accordion title="Error: 'object_store' not found">
+  SlateDB re-exports the `object_store` crate. Use `slatedb::object_store` instead of adding it as a separate dependency.
+</Accordion>
+
+<Accordion title="Async runtime errors">
+  Make sure you're running your code within a Tokio runtime using `#[tokio::main]` or by manually creating a runtime.
+</Accordion>
+
+<Accordion title="Connection to object storage fails">
+  - Verify your credentials are correct
+  - Check that your bucket/container exists
+  - Ensure network connectivity to the object storage service
+</Accordion>
+
+## Get Help
+
+- [GitHub Discussions](https://github.com/slatedb/slatedb/discussions) - Ask questions
+- [Discord](https://discord.gg/mHYmGy5MgA) - Chat with the community
+- [API Reference](/api/db) - Detailed API documentation

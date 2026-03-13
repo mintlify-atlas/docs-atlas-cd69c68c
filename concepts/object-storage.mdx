@@ -1,0 +1,476 @@
+---
+title: Object Storage Integration
+description: How SlateDB leverages object storage as its primary storage tier
+---
+
+## Why Object Storage?
+
+SlateDB uses object storage instead of local disk as the source of truth. This design decision is rooted in the vision described in CLEAN_SLATE.md:11:
+
+> We believe that the future of object storage is multi-region, low latency buckets that support atomic compare-and-swap operations.
+
+Object storage provides several key advantages:
+
+### Cost Efficiency
+
+From rfcs/0002-compaction.md:85:
+
+> Object storage costs about 1/5th-1/20th the cost of local disk depending on replication factor and storage tier.
+
+Examples:
+- S3 Standard: $0.023/GB/month
+- EBS (single AZ): $0.08/GB/month  
+- EBS (multi-AZ): $0.16/GB/month
+
+### Unlimited Capacity
+
+From CLEAN_SLATE.md:26:
+
+> Object storage is always the only source of truth.
+
+No need to:
+- Provision disk space in advance
+- Monitor disk usage
+- Handle "disk full" errors
+- Migrate to larger volumes
+
+### Built-in Durability
+
+Object storage providers offer:
+- 11 9's durability (99.999999999%)
+- Automatic replication across availability zones
+- Versioning and lifecycle policies
+- No RAID management needed
+
+### Easy Replication
+
+From README.md:15:
+
+> Leveraging object storage allows SlateDB to provide bottomless storage capacity, high durability, and easy replication.
+
+Object storage handles:
+- Cross-region replication
+- Read replicas
+- Disaster recovery
+- No custom replication logic needed
+
+## Supported Object Stores
+
+SlateDB uses the [`object_store`](https://docs.rs/object_store/latest/object_store/) crate and supports any compatible implementation:
+
+- **Amazon S3** - Standard, S3 Express One Zone
+- **Google Cloud Storage (GCS)**
+- **Azure Blob Storage (ABS)**  
+- **MinIO** - Self-hosted S3-compatible storage
+- **Tigris** - Globally distributed S3-compatible storage
+- **In-Memory** - For testing
+
+From README.md:111:
+
+```rust
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+
+let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+let kv_store = Db::open("/tmp/test_kv_store", object_store).await?;
+```
+
+## Object Storage Operations
+
+### Write Operations
+
+SlateDB performs two main types of writes:
+
+#### 1. WAL Writes
+
+From README.md:17:
+
+> To mitigate high write API costs (PUTs), SlateDB batches writes. Rather than writing every `put()` call to object storage, MemTables are flushed periodically to object storage as a string-sorted table (SST).
+
+Configuration from slatedb/src/config.rs:589:
+
+```rust
+/// How frequently to flush the write-ahead log to object storage.
+pub flush_interval: Option<Duration>,
+```
+
+Example cost calculation:
+- S3 Standard PUT: $0.005 per 1,000 requests
+- 100ms flush interval: ~10 PUTs/second = 864,000 PUTs/day
+- Daily cost: $4.32
+- Monthly cost: ~$130
+
+#### 2. Compaction Writes
+
+Compaction writes are less frequent but larger:
+
+- Merge multiple SSTs into sorted runs
+- Write result to `compacted/` directory
+- Use ULID naming for uniqueness
+
+From rfcs/0002-compaction.md:1097:
+
+```rust
+/// A compacted SSTable's maximum size (in bytes).
+pub max_sst_size: usize,
+```
+
+Default: 256 MiB per compacted SST.
+
+### Read Operations
+
+SlateDB optimizes reads to minimize GET requests:
+
+#### Block-Level Reads
+
+From slatedb/src/config.rs:233:
+
+```rust
+pub fn as_bytes(&self) -> usize {
+    match self {
+        SstBlockSize::Block4Kib => 4096,  // default
+        // ...
+    }
+}
+```
+
+SlateDB reads SSTs in 4 KiB blocks by default, not entire files.
+
+#### Caching Strategy
+
+From README.md:21:
+
+> To mitigate read latency and read API costs (GETs), SlateDB will use standard LSM-tree caching techniques: in-memory block caches, compression, bloom filters, and local SST disk caches.
+
+This reduces object storage API calls dramatically.
+
+### List Operations
+
+Listing is used during:
+
+- Database startup (find latest manifest)
+- WAL recovery (discover WAL SSTs)
+- Garbage collection (find deletable files)
+
+From rfcs/0001-manifest.md:361:
+
+```
+1. List `manifest` to find the manifest with the largest ID.
+2. Read `manifest/00000000000000000002.manifest` to read the current manifest.
+```
+
+## File Organization
+
+SlateDB organizes files hierarchically in object storage:
+
+### Directory Structure
+
+From rfcs/0001-manifest.md:212:
+
+```
+some-bucket/
+├─ manifest/
+│  ├─ 00000000000000000000.manifest
+│  ├─ 00000000000000000001.manifest
+│  ├─ 00000000000000000002.manifest
+├─ wal/
+│  ├─ 00000000000000000000.sst
+│  ├─ 00000000000000000001.sst
+│  ├─ ...
+├─ compacted/
+│  ├─ 01ARZ3NDEKTSV4RRFFQ69G5FAV.sst
+│  ├─ 01BX5ZZKBKACTAV9WEVGEMMVRZ.sst
+│  ├─ ...
+```
+
+### Naming Conventions
+
+#### Manifest Files
+
+From rfcs/0001-manifest.md:234:
+
+> The manifest's name is formatted as 20 digit zero-padded numbers to fit u64's maximum integer and to support lexicographical sorting.
+
+Example: `00000000000000000002.manifest`
+
+Highest ID = current manifest.
+
+#### WAL SSTs
+
+From rfcs/0001-manifest.md:340:
+
+> SST object names are formatted as 20 digit zero-padded numbers to fit u64's maximum integer and to support lexicographical sorting.
+
+Example: `00000000000000000123.sst`
+
+Sequential and contiguous - no gaps allowed.
+
+#### Compacted SSTs
+
+From rfcs/0002-compaction.md:136:
+
+> We will use ULIDs to name compacted SSTs.
+
+Example: `01ARZ3NDEKTSV4RRFFQ69G5FAV.sst`
+
+ULIDs provide:
+- Lexicographically sortable
+- 128-bit uniqueness
+- Timestamp prefix
+
+## Compare-and-Swap (CAS) Operations
+
+### The CAS Challenge
+
+SlateDB requires atomic operations to prevent corruption. From rfcs/0001-manifest.md:145:
+
+> Most object stores provide CAS (a.k.a. preconditions, conditionals, `If-None-Match`, `If-Match`, and so on). But S3 does not, and we want to support S3.
+
+### Two-Phase CAS Protocol
+
+For object stores without native CAS (like S3), SlateDB implements a two-phase protocol using a transactional store (DynamoDB, MySQL, etc.).
+
+From rfcs/0001-manifest.md:179:
+
+```
+1. Write the new manifest to a temporary location
+2. Write a record to a transactional store:
+   - source: temporary location
+   - destination: final location  
+   - committed: false
+3. Copy object from temporary to final location
+4. Update transactional record to committed: true
+5. Delete temporary object
+```
+
+Once step 2 completes, the write is considered durable. The CAS succeeds only if no other writer has inserted a record for the same destination.
+
+### CAS for Different Scenarios
+
+From rfcs/0001-manifest.md:147:
+
+1. **Immutable objects** - "Create if not exists" semantics
+2. **Mutable objects** - Version-based updates
+
+SlateDB uses:
+- **Pattern 1 (CAS)** - When object store supports it (GCS, Azure)
+- **Pattern 5 (Two-phase write)** - When object store doesn't (S3)
+
+### Fencing with CAS
+
+From rfcs/0001-manifest.md:232:
+
+> Writers will set this on each SST written into `wal`.
+
+Each WAL SST includes a `writer_epoch` metadata field. New writers:
+
+1. Increment epoch in manifest (using CAS)
+2. Write empty fencing SST with new epoch
+3. Old writers detect higher epoch and halt
+
+This prevents split-brain and zombie writers.
+
+## Latency Considerations
+
+### Write Latency
+
+From README.md:19:
+
+> `put()` returns a `Future` that resolves when the data is durably persisted. Clients that prefer lower latency at the cost of durability can instead use `put_with_options` with `await_durable` set to `false`.
+
+Configuration from slatedb/src/config.rs:422:
+
+```rust
+pub struct WriteOptions {
+    /// Whether `put` calls should block until the write has been durably committed
+    pub await_durable: bool,
+}
+```
+
+Trade-offs:
+- `await_durable: true` → Higher latency, guaranteed durability
+- `await_durable: false` → Lower latency, durability delayed until flush
+
+### Read Latency
+
+From rfcs/0002-compaction.md:83:
+
+> We certainly don't want to be doing multiple, if any, GET operations per SlateDB read, as GETs are expensive and slow.
+
+Typical S3 GET latency: 50-100ms
+
+Mitigation strategies:
+1. **Block caching** - Cache frequently accessed blocks
+2. **Bloom filters** - Avoid unnecessary SST reads  
+3. **Prefetching** - Read ahead during scans
+4. **Disk caching** - Local SST cache on disk
+
+### Manifest Update Latency
+
+From rfcs/0001-manifest.md:336:
+
+> If a client gets 100MB/s to and from EC2 to S3, it would take 56ms to read and 56ms to write (plus serialization, network, and TCP overhead). All in, let's say 250-500ms.
+
+For a 5.6 MiB manifest with 100,000 compacted SSTs and 1,000 snapshots.
+
+From rfcs/0001-manifest.md:387:
+
+> Luckily, all events except (6) [compaction finishes] should occur at the minute granularity or larger.
+
+Manifest contention is rare in practice.
+
+## Cost Optimization
+
+### API Cost Breakdown
+
+S3 Standard pricing (as of 2024):
+- PUT/COPY/POST/DELETE: $0.005 per 1,000 requests
+- GET/SELECT: $0.0004 per 1,000 requests
+- LIST: $0.005 per 1,000 requests
+
+### Write Cost Optimization
+
+From slatedb/src/config.rs:580:
+
+```rust
+/// When setting this configuration, users must consider:
+/// * **API cost**: The lower the flush interval, the more frequently PUT calls
+///   will be made to object storage. This can increase your object storage costs.
+```
+
+Example:
+- 1 second flush interval: ~86,400 PUTs/day = $0.43/day = $13/month
+- 100ms flush interval: ~864,000 PUTs/day = $4.32/day = $130/month
+
+### Read Cost Optimization
+
+Strategies to minimize GETs:
+
+1. **Larger block cache** - More hits, fewer GETs
+2. **Disk cache** - Local SST storage
+3. **Bloom filters** - Skip non-existent keys
+4. **Larger L0 SSTs** - Fewer files to check
+
+From slatedb/src/config.rs:641:
+
+```rust
+/// * **API cost**: Smaller L0 SSTable sizes will result in more frequent writes
+///   to object storage. This can increase your object storage costs.
+```
+
+### Data Transfer Costs
+
+From rfcs/0002-compaction.md:81:
+
+> The major cloud providers don't charge for data transfers to/from the "standard" tier of object storage (provided you set up networking correctly).
+
+Key points:
+- Ingress (to S3): Free
+- Egress (from S3): Charged (but avoid with caching)
+- Same-region traffic: Free with correct VPC setup
+
+## Disk Cache Integration
+
+SlateDB can cache SSTs on local disk to reduce object storage access.
+
+From slatedb/src/config.rs:1318:
+
+```rust
+pub struct ObjectStoreCacheOptions {
+    /// The root folder where the cache files are stored.
+    pub root_folder: Option<std::path::PathBuf>,
+    /// The limit of the cache size in bytes.
+    pub max_cache_size_bytes: Option<usize>,
+    /// The size of each part file.
+    pub part_size_bytes: usize,
+}
+```
+
+Benefits:
+- Dramatically reduced GET requests
+- Lower read latency
+- Reduced object storage costs
+- Better cache hit rates
+
+From README.md:132:
+
+```
+- [x] Disk cache (#9)
+```
+
+## Object Storage Compatibility
+
+### S3 Compatibility
+
+SlateDB works with S3-compatible storage:
+
+```rust
+use object_store::aws::AmazonS3Builder;
+
+let s3 = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-west-2")
+    .build()?;
+```
+
+### GCS Compatibility
+
+```rust
+use object_store::gcp::GoogleCloudStorageBuilder;
+
+let gcs = GoogleCloudStorageBuilder::new()
+    .with_bucket_name("my-bucket")
+    .build()?;
+```
+
+### Azure Compatibility
+
+```rust
+use object_store::azure::MicrosoftAzureBuilder;
+
+let azure = MicrosoftAzureBuilder::new()
+    .with_container_name("my-container")
+    .build()?;
+```
+
+## Future Optimizations
+
+### Multi-Part Uploads
+
+For large SSTs, multi-part uploads could:
+- Improve upload throughput
+- Enable resumable uploads
+- Parallelize uploads
+
+### Object Versioning
+
+From rfcs/0001-manifest.md:733:
+
+> We found that Terraform had explored this idea in their S3 backend.
+
+Object versioning could provide CAS semantics on S3 without a transactional store.
+
+### Intelligent Tiering
+
+Leverage storage tiers:
+- Hot data → S3 Standard
+- Warm data → S3 Infrequent Access  
+- Cold data → S3 Glacier
+
+Automatic lifecycle policies based on access patterns.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Caching" icon="database" href="/concepts/caching">
+    Learn about caching strategies
+  </Card>
+  <Card title="Compaction" icon="compress" href="/concepts/compaction">
+    Understand compaction process
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    See the full system architecture
+  </Card>
+  <Card title="LSM-Tree" icon="sitemap" href="/concepts/lsm-tree">
+    Explore LSM-tree fundamentals
+  </Card>
+</CardGroup>
